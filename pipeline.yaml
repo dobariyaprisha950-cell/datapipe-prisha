@@ -1,0 +1,10 @@
+name: sample-sales-yaml
+sources:
+  - name: sales
+    type: csv
+    path: examples/data/sales.csv
+transforms: []
+sink:
+  type: jsonl
+  output_dir: examples/output-yaml
+  partition_by: date

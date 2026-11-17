@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "datapipe-prisha"
+version = "0.1.0"
+description = "An asynchronous, validated, resumable data pipeline CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [{name = "Prisha"}]
+dependencies = ["aiohttp>=3.11,<4", "pydantic>=2.10,<3", "typer>=0.15,<1", "pyarrow>=18,<24", "PyYAML>=6,<7", "opentelemetry-api>=1.29,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]
+
+[project.scripts]
+datapipe = "datapipe.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/datapipe"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/datapipe/py.typed" = "datapipe/py.typed"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["datapipe"]
+plugins = ["pydantic.mypy"]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]

@@ -1,0 +1,5 @@
+id,date,amount
+sale-1,2026-11-14,12.50
+sale-2,2026-11-15,20
+sale-1,2026-11-15,12.50
+bad-date,not-a-date,8

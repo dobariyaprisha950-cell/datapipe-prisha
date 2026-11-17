@@ -1,0 +1,25 @@
+name: Publish TestPyPI
+on:
+  release:
+    types: [published]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  publish:
+    environment: testpypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: uv lock
+      - run: uv lock --check
+      - run: uv sync --locked --group dev
+      - run: uv run pytest
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/

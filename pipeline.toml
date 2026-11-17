@@ -1,0 +1,25 @@
+name = "sample-sales"
+concurrency = 4
+queue_size = 500
+checkpoint = "examples/output/checkpoint.json"
+log_level = "INFO"
+[[sources]]
+name = "sales-csv"
+type = "csv"
+path = "examples/data/sales.csv"
+[[sources]]
+name = "supplement"
+type = "jsonl"
+path = "examples/data/supplement.jsonl"
+[[transforms]]
+type = "mapping"
+[transforms.settings.fields]
+amount = "value"
+[[transforms]]
+type = "deduplication"
+[transforms.settings]
+key = "id"
+[sink]
+type = "jsonl"
+output_dir = "examples/output"
+partition_by = "date"
