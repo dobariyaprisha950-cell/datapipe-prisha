@@ -6,6 +6,19 @@ An asynchronous Python CLI for ingesting HTTP JSON, CSV and JSONL, validating re
 
 Python 3.12+. Install with `uv sync --group dev`; run the CLI with `uv run datapipe --help`. Package name: `datapipe-prisha`; import and command: `datapipe`.
 
+On Windows, install the Python install manager and Python 3.12, plus uv, from PowerShell:
+
+```powershell
+winget install 9NQ7512CXL7T -e --accept-package-agreements --disable-interactivity
+py install 3.12
+winget install --id=astral-sh.uv -e
+# Open a new terminal, then check:
+py -3.12 --version
+uv --version
+```
+
+Then, from this repository, run `uv lock` followed by `uv sync --locked --group dev`. If the `py` command still resolves to a legacy launcher, remove/disable that launcher and reopen the terminal.
+
 ## Quick start
 
 From the repository root run `uv run datapipe validate-config pipeline.toml`, then `uv run datapipe run pipeline.toml`. The included example reads CSV and JSONL, maps and deduplicates, then writes date partitions, dead letters and a summary under `examples/output/`. Use `--dry-run`, `--json`, or `--fail-fast`. `--version`, `validate-config`, and `list-plugins` are available.
