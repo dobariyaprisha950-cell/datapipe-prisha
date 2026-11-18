@@ -18,5 +18,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy src/
       - run: uv run pytest --cov=datapipe.core --cov-branch --cov-report=term-missing --cov-fail-under=85
+      - name: POSIX SIGINT and SIGTERM integration tests
+        run: uv run pytest tests/test_signal_shutdown.py -vv
       - run: uv run pip-audit
       - run: uv build

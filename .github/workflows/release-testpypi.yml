@@ -1,26 +1,82 @@
 name: Publish TestPyPI
+
 on:
   release:
     types: [published]
+
 permissions:
-  id-token: write
   contents: read
+
+concurrency:
+  group: testpypi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    environment: testpypi
+  validate:
+    name: Validate and build distributions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
-        with: {python-version: '3.12'}
-      - run: uv lock
+        with:
+          python-version: '3.12'
       - run: uv lock --check
       - run: uv sync --locked --group dev
       - run: uv pip install --editable examples/plugin
-      - run: uv run pytest --cov=datapipe.core --cov-branch --cov-report=term-missing --cov-fail-under=85
+      - run: uv run ruff check .
+      - run: uv run mypy src/
+      - run: uv run pytest --ignore=tests/test_signal_shutdown.py --cov=datapipe.core --cov-branch --cov-report=term-missing --cov-fail-under=85
+      - name: Run real POSIX signal and resume tests
+        run: uv run pytest tests/test_signal_shutdown.py -vv
+      - run: uv run pip-audit
       - run: uv build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Validate wheel and source distribution metadata
+        run: uvx --from twine twine check dist/*
+      - name: Verify expected distribution files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = {path.name for path in Path("dist").glob("*")}
+          wheels = [name for name in files if name.endswith(".whl")]
+          sdists = [name for name in files if name.endswith(".tar.gz")]
+          import tomllib
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          expected_prefix = f"{project['name'].replace('-', '_')}-{project['version']}"
+          assert len(wheels) == 1, f"expected one wheel, got {wheels}"
+          assert len(sdists) == 1, f"expected one sdist, got {sdists}"
+          assert wheels[0].startswith(expected_prefix), wheels[0]
+          assert sdists[0].startswith(expected_prefix), sdists[0]
+          print(f"validated {wheels[0]} and {sdists[0]}")
+          PY
+      - name: Install wheel in a clean environment and check CLI
+        run: |
+          uv venv work/wheel-check --python 3.12
+          uv pip install --python work/wheel-check/bin/python dist/*.whl
+          work/wheel-check/bin/datapipe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish to TestPyPI
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist
+      - name: Publish distributions with GitHub OIDC
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist/

@@ -47,11 +47,9 @@ Stateful checkpoints written before transform-state journaling was added cannot 
 
 HTTP credentials are read from environment variables and logs pass through a redaction filter. OpenTelemetry stage spans and external secret-manager integration are not implemented.
 
-## TestPyPI release preparation
+## GitHub and TestPyPI release setup
 
-The workflow at `.github/workflows/release-testpypi.yml` publishes a GitHub Release to TestPyPI using OIDC after lock, audit, tests, and build checks. It requests `id-token: write` and `contents: read`, and uses the GitHub environment named `testpypi`. It stores no PyPI token.
-
-Before releasing, configure a TestPyPI trusted publisher with the GitHub owner, repository, workflow filename `.github/workflows/release-testpypi.yml`, and environment `testpypi`. Configure the `testpypi` environment in GitHub and apply any required reviewer protection. The distribution metadata is `datapipe-prisha` version `0.1.0`. This workspace currently has no Git remote and no external publisher configuration was verified; repository creation, trusted-publisher setup, and publication remain manual. Do not publish until those settings are in place and a release is authorized.
+Release workflow setup and manual repository steps are documented in [RELEASE.md](RELEASE.md). The workflow validates the project on Ubuntu, runs the real POSIX signal tests, builds and checks both distributions, smoke-installs the wheel, and publishes only to TestPyPI using OIDC. It stores no PyPI token. This checkout has no Git remote; no repository creation or package upload has been performed.
 
 ## Development
 
