@@ -7,12 +7,68 @@ from typing import Any
 import pytest
 from aiohttp import web
 
-from datapipe.config.schema import PipelineConfig
-from datapipe.core.engine import run_pipeline
+from datapipe.config.schema import PipelineConfig, SourceConfig
+from datapipe.core.engine import _blocking_to_completion, _source, _transform_record, run_pipeline
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
 from datapipe.sinks.jsonl import JSONLSink
 from datapipe.sources.jsonl import JSONLSource
+
+
+@pytest.mark.asyncio
+async def test_blocking_commit_finishes_before_cancellation_propagates() -> None:
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def commit() -> str:
+        started.set()
+        assert release.wait(3)
+        return "committed"
+
+    task = asyncio.create_task(_blocking_to_completion(commit))
+    assert await asyncio.to_thread(started.wait, 3)
+    task.cancel()
+    await asyncio.sleep(0.02)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_plugin_source_receives_optional_common_path_and_url() -> None:
+    class GenericPlugin:
+        def __init__(self, **settings: Any) -> None:
+            self.settings = settings
+
+    SourceRegistry.register("test-generic-settings", GenericPlugin)
+    config = SourceConfig.model_validate(
+        {
+            "name": "plugin",
+            "type": "test-generic-settings",
+            "path": "plugin-data.csv",
+            "url": "https://example.invalid/data",
+        }
+    )
+    source = _source(config, {})
+    assert source.settings["path"] == "plugin-data.csv"
+    assert source.settings["url"] == "https://example.invalid/data"
+
+
+def test_fingerprint_transform_preserves_non_numeric_values() -> None:
+    config = PipelineConfig.model_validate(
+        {
+            "name": "fingerprint-nonnumeric",
+            "sources": [{"name": "input", "type": "jsonl", "path": "unused.jsonl"}],
+            "transforms": [
+                {"type": "cpu_fingerprint", "settings": {"field": "value", "rounds": 5}}
+            ],
+            "sink": {"type": "jsonl", "output_dir": "unused-output"},
+        }
+    )
+    row = {"id": "record", "value": "opaque"}
+    assert _transform_record(row, config) == row
 
 
 @pytest.mark.asyncio
@@ -417,7 +473,10 @@ async def test_record_local_mapping_and_filtering_use_batched_stream_path(
 
 
 @pytest.mark.asyncio
-async def test_fingerprint_transform_uses_batched_stream_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("execution", ["auto", "thread", "process"])
+async def test_fingerprint_transform_uses_batched_stream_path(
+    tmp_path: Path, execution: str
+) -> None:
     from datapipe.transforms.parallel import _fingerprint
 
     source = tmp_path / "fingerprint.jsonl"
@@ -434,7 +493,13 @@ async def test_fingerprint_transform_uses_batched_stream_path(tmp_path: Path) ->
             "transforms": [
                 {
                     "type": "cpu_fingerprint",
-                    "settings": {"field": "value", "output_field": "fp", "rounds": 5000},
+                    "settings": {
+                        "field": "value",
+                        "output_field": "fp",
+                        "rounds": 5000,
+                        "execution": execution,
+                        "workers": 2,
+                    },
                 }
             ],
             "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 1},

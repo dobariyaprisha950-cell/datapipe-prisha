@@ -1,3 +1,4 @@
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -6,8 +7,10 @@ from datapipe.transforms.deduplication import deduplicate
 from datapipe.transforms.filtering import filter_records
 from datapipe.transforms.mapping import map_record
 from datapipe.transforms.parallel import (
+    FingerprintExecutor,
     _fingerprint,
     _fingerprint_fast,
+    choose_fingerprint_execution,
     fingerprint_records,
     fingerprint_records_parallel,
 )
@@ -43,6 +46,28 @@ def test_parallel_cpu_fingerprint_matches_python_baseline():
     pure = fingerprint_records(records, "value", "fingerprint", rounds=40)
     parallel = fingerprint_records_parallel(records, "value", "fingerprint", rounds=40, workers=3)
     assert parallel == pure
+
+
+@pytest.mark.parametrize("execution", ["sequential", "thread", "process"])
+def test_fingerprint_execution_override_is_deterministic(execution):
+    records = [{"id": index, "value": index * 17} for index in range(16)]
+    expected = fingerprint_records(records, "value", "fp", rounds=5000)
+    actual = fingerprint_records_parallel(
+        records, "value", "fp", rounds=5000, workers=2, execution=execution
+    )
+    assert actual == expected
+
+
+def test_automatic_fingerprint_strategy_avoids_measured_dispatch_overhead():
+    assert choose_fingerprint_execution(20_000, 5_000, workers=4) == "sequential"
+
+
+def test_streaming_fingerprint_executor_closes_and_matches_baseline():
+    executor = FingerprintExecutor("thread", workers=2)
+    try:
+        assert executor.apply(123, 5000) == _fingerprint(123, 5000)
+    finally:
+        executor.close()
 
 
 @given(st.lists(st.integers(), max_size=100))

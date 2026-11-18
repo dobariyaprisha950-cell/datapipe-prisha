@@ -44,6 +44,42 @@ class TransformConfig(BaseModel):
     type: Literal["mapping", "filtering", "deduplication", "aggregation", "cpu_fingerprint"]
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_transform_settings(self) -> "TransformConfig":
+        if self.type == "filtering":
+            if not isinstance(self.settings.get("field"), str):
+                raise ValueError("filtering requires a string field")
+            if self.settings.get("op") not in {
+                "eq", "ne", "gt", "ge", "lt", "le", "in", "contains"
+            }:
+                raise ValueError("filtering op must be eq, ne, gt, ge, lt, le, in, or contains")
+        elif self.type == "deduplication":
+            if not isinstance(self.settings.get("key"), str) or not self.settings["key"]:
+                raise ValueError("deduplication requires a non-empty key")
+        elif self.type == "aggregation":
+            metrics = self.settings.get("metrics", {})
+            if not isinstance(metrics, dict) or any(
+                not isinstance(field, str)
+                or operation not in {"sum", "count", "min", "max"}
+                for field, operation in metrics.items()
+            ):
+                raise ValueError("aggregation metrics must map fields to sum, count, min, or max")
+        elif self.type == "cpu_fingerprint":
+            if not isinstance(self.settings.get("field"), str):
+                raise ValueError("cpu_fingerprint requires a string field")
+            if int(self.settings.get("rounds", 1000)) < 1:
+                raise ValueError("cpu_fingerprint rounds must be positive")
+            if int(self.settings.get("workers", 1)) < 1:
+                raise ValueError("cpu_fingerprint workers must be positive")
+            if self.settings.get("execution", "auto") not in {
+                "auto", "sequential", "thread", "process"
+            }:
+                raise ValueError("cpu_fingerprint execution must be auto, sequential, thread, or process")
+            expected = self.settings.get("expected_records")
+            if expected is not None and int(expected) < 1:
+                raise ValueError("cpu_fingerprint expected_records must be positive")
+        return self
+
 
 class SinkConfig(BaseModel):
     type: Literal["jsonl", "parquet"] = "jsonl"

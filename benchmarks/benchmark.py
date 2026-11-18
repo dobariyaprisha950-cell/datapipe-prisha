@@ -55,27 +55,26 @@ def main() -> None:
     if a.records <= 0 or a.workers <= 0 or a.runs <= 0 or a.rounds <= 0:
         p.error("records, workers, runs and rounds must be positive")
     rows = [{"value": float(i % 997)} for i in range(a.records)]
-    timings: dict[str, list[float]] = {"pure": [], "parallel": []}
-    peak_rss: dict[str, list[float]] = {"pure": [], "parallel": []}
-    cpu_utilization: dict[str, list[float]] = {"pure": [], "parallel": []}
+    modes = ("sequential", "thread", "process")
+    timings: dict[str, list[float]] = {name: [] for name in modes}
+    peak_rss: dict[str, list[float]] = {name: [] for name in modes}
+    cpu_utilization: dict[str, list[float]] = {name: [] for name in modes}
     equality = True
     process = psutil.Process()
     for _ in range(a.runs):
         baseline = fingerprint_records(rows, "value", "fingerprint", a.rounds)
         baseline_digest = _digest(baseline)
         del baseline
-        parallel = fingerprint_records_parallel(rows, "value", "fingerprint", a.rounds, a.workers)
-        equality = equality and baseline_digest == _digest(parallel)
-        del parallel
-        for name, fn in (
-            ("pure", lambda: fingerprint_records(rows, "value", "fingerprint", a.rounds)),
-            (
-                "parallel",
-                lambda: fingerprint_records_parallel(
-                    rows, "value", "fingerprint", a.rounds, a.workers
-                ),
+        fns = {
+            "sequential": lambda: fingerprint_records(rows, "value", "fingerprint", a.rounds),
+            "thread": lambda: fingerprint_records_parallel(
+                rows, "value", "fingerprint", a.rounds, a.workers, "thread"
             ),
-        ):
+            "process": lambda: fingerprint_records_parallel(
+                rows, "value", "fingerprint", a.rounds, a.workers, "process"
+            ),
+        }
+        for name, fn in fns.items():
             sample: dict[str, float] = {"peak_rss": 0.0, "cpu_seconds": 0.0}
             stop = threading.Event()
             sampler = threading.Thread(
@@ -85,6 +84,7 @@ def main() -> None:
             start = time.perf_counter()
             output = fn()
             elapsed = time.perf_counter() - start
+            equality = equality and baseline_digest == _digest(output)
             stop.set()
             sampler.join()
             del output
@@ -93,7 +93,7 @@ def main() -> None:
             core_count = psutil.cpu_count(logical=True) or 1
             cpu_utilization[name].append(sample["cpu_seconds"] / elapsed / core_count * 100)
     if not equality:
-        raise RuntimeError("parallel output differed from sequential output")
+        raise RuntimeError("an execution strategy differed from sequential output")
     medians = {name: statistics.median(values) for name, values in timings.items()}
     results = {
         name: {
@@ -107,7 +107,9 @@ def main() -> None:
         }
         for name in timings
     }
-    results["speedup_median"] = medians["pure"] / medians["parallel"]
+    results["speedup_vs_sequential"] = {
+        mode: medians["sequential"] / medians[mode] for mode in modes
+    }
     results["output_equal"] = equality
     results["environment"] = {
         "python": platform.python_version(),

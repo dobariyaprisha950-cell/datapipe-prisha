@@ -15,3 +15,7 @@ class SourceError(DatapipeError):
 
 class SinkError(DatapipeError):
     """Output could not be committed."""
+
+
+class TransformStateError(DatapipeError):
+    """Disk-backed deduplication or aggregation state failed."""

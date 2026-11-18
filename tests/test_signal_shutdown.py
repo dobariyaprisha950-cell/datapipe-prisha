@@ -25,7 +25,7 @@ def test_cli_handles_real_termination_signal_and_keeps_committed_batches(
         f'checkpoint="{(tmp_path / "checkpoint.json").as_posix()}"\n'
         f'[[sources]]\nname="input"\ntype="jsonl"\npath="{source.as_posix()}"\n'
         f'[sink]\ntype="jsonl"\noutput_dir="{output.as_posix()}"\n'
-        "batch_size=25\n",
+        "batch_size=5000\n",
         encoding="utf-8",
     )
     executable = Path(sys.executable).with_name("datapipe")
@@ -53,4 +53,19 @@ def test_cli_handles_real_termination_signal_and_keeps_committed_batches(
     assert process.returncode == expected, (stdout, stderr)
     checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
     assert checkpoint["cursors"]["input"] > 0
+    assert list((output / ".datapipe" / "staging").iterdir()) == []
+
+    resumed = subprocess.run(
+        [str(executable), "run", str(config)],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    final_checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert final_checkpoint["cursors"]["input"] == 250_000
+    parts = list(output.glob("date=*/part-*.jsonl"))
+    assert sum(sum(1 for _ in part.open(encoding="utf-8")) for part in parts) == 250_000
     assert list((output / ".datapipe" / "staging").iterdir()) == []

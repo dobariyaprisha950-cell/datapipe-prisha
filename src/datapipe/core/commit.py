@@ -11,7 +11,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -164,6 +164,7 @@ class OutputCommitter:
         dead_letters: Sequence[Mapping[str, Any]],
         cursors: Mapping[str, Any],
         sink: Any,
+        state_updates: Sequence[Mapping[str, Any]] = (),
     ) -> list[Path]:
         """Stage output, journal intent, promote files, then advance cursors."""
         sequence = self.manifest["next_sequence"]
@@ -202,6 +203,24 @@ class OutputCommitter:
                         ),
                     }
                 )
+            if state_updates:
+                staged_state = stage_root / "transform-state.jsonl"
+                with staged_state.open("w", encoding="utf-8", newline="\n") as stream:
+                    for update in state_updates:
+                        stream.write(
+                            json.dumps(dict(update), allow_nan=True, separators=(",", ":")) + "\n"
+                        )
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                files.append(
+                    {
+                        "staged": str(staged_state.relative_to(self.root)),
+                        "target": str(
+                            (self.metadata / "transform-state" / f"{batch_id}.jsonl")
+                            .relative_to(self.root)
+                        ),
+                    }
+                )
 
             batch = {
                 "sequence": sequence,
@@ -224,7 +243,46 @@ class OutputCommitter:
                 shutil.rmtree(stage_root, ignore_errors=True)
             raise
         self._publish(batch_id, batch)
-        return [self._target(item["target"]) for item in files if "dead-letter-batches" not in item["target"]]
+        return [
+            self._target(item["target"])
+            for item in files
+            if "dead-letter-batches" not in item["target"]
+            and "transform-state" not in item["target"]
+        ]
+
+    def committed_transform_updates(self) -> Iterable[dict[str, Any]]:
+        """Stream journal-committed transform state updates in batch order."""
+        batches = sorted(
+            self.manifest["batches"].items(), key=lambda item: item[1].get("sequence", 0)
+        )
+        for batch_id, batch in batches:
+            if batch.get("status") != "committed":
+                continue
+            state_file = self.metadata / "transform-state" / f"{batch_id}.jsonl"
+            if not state_file.exists():
+                continue
+            with state_file.open(encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"invalid transform state in {state_file}:{line_number}: {exc}"
+                        ) from exc
+                    if not isinstance(event, dict):
+                        raise TypeError(
+                            f"invalid transform state in {state_file}:{line_number}: expected object"
+                        )
+                    yield event
+
+    def has_committed_transform_state(self) -> bool:
+        """Whether this journal has a committed transform-state generation."""
+        for batch_id, batch in self.manifest["batches"].items():
+            if batch.get("status") != "committed":
+                continue
+            if (self.metadata / "transform-state" / f"{batch_id}.jsonl").is_file():
+                return True
+        return False
 
     def materialize_dead_letters(self) -> None:
         """Rebuild the public aggregate from committed immutable batch files."""

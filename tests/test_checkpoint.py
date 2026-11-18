@@ -32,3 +32,24 @@ def test_checkpoint_rejects_changed_pipeline_configuration(tmp_path: Path) -> No
     assert Checkpoint(path, "config-a").load() == {"source": 10}
     with pytest.raises(ValueError, match="configuration does not match"):
         Checkpoint(path, "config-b").load()
+
+
+def test_signed_checkpoint_requires_cursor_object(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"version": 1, "signature": "expected", "cursors": []}))
+    with pytest.raises(TypeError, match="cursors must be an object"):
+        Checkpoint(path, "expected").load()
+
+
+def test_failed_checkpoint_replace_removes_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import datapipe.core.checkpoint as checkpoint_module
+
+    def fail_replace(_source: str, _target: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        Checkpoint(tmp_path / "state.json").save({"cursor": 1})
+    assert list(tmp_path.glob(".checkpoint-*")) == []

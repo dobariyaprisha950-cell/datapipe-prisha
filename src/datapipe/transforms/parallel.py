@@ -1,9 +1,69 @@
 """CPU transform using a process pool for deterministic numeric normalization."""
 
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
+
+ExecutionMode = Literal["auto", "sequential", "thread", "process"]
+
+
+def choose_fingerprint_execution(
+    records: int, rounds: int, workers: int = 2
+) -> Literal["sequential", "thread", "process"]:
+    """Estimate dispatch versus useful work using measured host behavior.
+
+    The exact recurrence makes per-record work O(1) after coefficients are
+    cached. Measurements on the project host showed process startup and value
+    serialization dominating even a 20k-record workload, so automatic mode is
+    deliberately conservative and selects sequential execution.
+    """
+    if records < 2 or workers < 2 or rounds < 1:
+        return "sequential"
+    bit_work = rounds.bit_length()
+    estimated_sequential_seconds = 0.0000006 * records + 0.000002 * bit_work
+    estimated_process_seconds = 0.85 + 0.0000028 * records + estimated_sequential_seconds / workers
+    estimated_thread_seconds = 0.00015 + estimated_sequential_seconds * 1.05
+    if estimated_process_seconds < estimated_sequential_seconds:
+        return "process"
+    if estimated_thread_seconds < estimated_sequential_seconds:
+        return "thread"
+    return "sequential"
+
+
+class FingerprintExecutor:
+    """Reusable explicit execution override for streaming pipeline records."""
+
+    def __init__(
+        self,
+        mode: ExecutionMode = "auto",
+        workers: int = 1,
+        expected_records: int | None = None,
+        rounds: int = 1000,
+    ) -> None:
+        if workers < 1:
+            raise ValueError("workers must be positive")
+        self.mode: Literal["sequential", "thread", "process"] = (
+            choose_fingerprint_execution(expected_records, rounds, workers)
+            if mode == "auto" and expected_records is not None
+            else "sequential" if mode == "auto" else mode
+        )
+        self.workers = workers
+        self._pool: ProcessPoolExecutor | ThreadPoolExecutor | None = None
+        if self.mode == "process" and workers > 1:
+            self._pool = ProcessPoolExecutor(max_workers=workers)
+        elif self.mode == "thread" and workers > 1:
+            self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="datapipe-fp")
+
+    def apply(self, value: int, rounds: int) -> int:
+        if self._pool is None:
+            return _fingerprint_fast(value, rounds)
+        return self._pool.submit(_fingerprint_fast, value, rounds).result()
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
 
 def _normalize(chunk: list[dict[str, Any]], field: str) -> list[dict[str, Any]]:
@@ -131,6 +191,7 @@ def fingerprint_records_parallel(
     output_field: str,
     rounds: int = 1000,
     workers: int = 2,
+    execution: ExecutionMode = "auto",
 ) -> list[dict[str, Any]]:
     """Parallel equivalent using process-safe integer chunks and stable ordering."""
     if rounds < 1:
@@ -141,7 +202,12 @@ def fingerprint_records_parallel(
         for index, row in enumerate(items)
         if isinstance(row.get(field), (int, float))
     ]
-    if len(positions_and_values) < 2 or workers < 2:
+    strategy = (
+        choose_fingerprint_execution(len(positions_and_values), rounds, workers)
+        if execution == "auto"
+        else execution
+    )
+    if len(positions_and_values) < 2 or workers < 2 or strategy == "sequential":
         return fingerprint_records(items, field, output_field, rounds)
     chunk_size = (len(positions_and_values) + workers - 1) // workers
     chunks = [
@@ -149,7 +215,8 @@ def fingerprint_records_parallel(
         for index in range(0, len(positions_and_values), chunk_size)
     ]
     tasks = [([value for _, value in chunk], rounds) for chunk in chunks]
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    executor_type = ProcessPoolExecutor if strategy == "process" else ThreadPoolExecutor
+    with executor_type(max_workers=workers) as pool:
         results = list(pool.map(_fingerprint_chunk, tasks))
     for chunk, fingerprints in zip(chunks, results, strict=True):
         for (index, _), fingerprint in zip(chunk, fingerprints, strict=True):

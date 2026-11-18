@@ -89,3 +89,29 @@ def test_recovery_rejects_unknown_state_and_cleans_orphan_stage_paths(tmp_path: 
 def test_complete_missing_run_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="missing from the output manifest"):
         _committer(tmp_path).complete_run("not-present")
+
+
+def test_transform_state_replay_skips_uncommitted_and_missing_deltas(tmp_path: Path) -> None:
+    committer = _committer(tmp_path)
+    state_dir = committer.metadata / "transform-state"
+    state_dir.mkdir()
+    (state_dir / "committed.jsonl").write_text('{"op":"version","version":1}\n')
+    committer.manifest["batches"] = {
+        "prepared": {"status": "prepared", "sequence": 1},
+        "committed-without-state": {"status": "committed", "sequence": 2},
+        "committed": {"status": "committed", "sequence": 3},
+    }
+    assert list(committer.committed_transform_updates()) == [{"op": "version", "version": 1}]
+    assert committer.has_committed_transform_state()
+
+
+def test_transform_state_replay_rejects_non_object_event(tmp_path: Path) -> None:
+    committer = _committer(tmp_path)
+    state_dir = committer.metadata / "transform-state"
+    state_dir.mkdir()
+    (state_dir / "bad.jsonl").write_text('[1, 2]\n')
+    committer.manifest["batches"] = {
+        "bad": {"status": "committed", "sequence": 1},
+    }
+    with pytest.raises(TypeError, match="expected object"):
+        list(committer.committed_transform_updates())

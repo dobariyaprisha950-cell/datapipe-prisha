@@ -9,10 +9,10 @@ import logging
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 from pydantic import ValidationError
@@ -34,9 +34,25 @@ from datapipe.transforms.aggregation import aggregate_daily
 from datapipe.transforms.deduplication import deduplicate
 from datapipe.transforms.filtering import filter_records
 from datapipe.transforms.mapping import map_record
-from datapipe.transforms.parallel import _fingerprint_fast, fingerprint_records_parallel
+from datapipe.transforms.parallel import (
+    ExecutionMode,
+    FingerprintExecutor,
+    _fingerprint_fast,
+    fingerprint_records_parallel,
+)
+from datapipe.transforms.state import DiskTransformProcessor
 
 log = logging.getLogger("datapipe")
+async def _blocking_to_completion[R](function: Callable[..., R], *args: Any) -> R:
+    """Run blocking commit work without releasing the writer lock mid-thread."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Cancelling an await does not stop the worker thread. Let atomic file
+        # promotion and checkpoint reconciliation finish before propagating.
+        await asyncio.shield(worker)
+        raise
 
 
 def _config_signature(config: PipelineConfig) -> str:
@@ -90,10 +106,14 @@ def _source(config: SourceConfig, saved: dict[str, Any]) -> Any:
     return SourceRegistry.create(config.type, **settings)
 
 
-def _transform_record(row: dict[str, Any], config: PipelineConfig) -> dict[str, Any] | None:
+def _transform_record(
+    row: dict[str, Any],
+    config: PipelineConfig,
+    fingerprint_executors: Mapping[int, FingerprintExecutor] | None = None,
+) -> dict[str, Any] | None:
     """Apply the order-preserving, record-local transformation subset."""
     result = row
-    for transform in config.transforms:
+    for stage, transform in enumerate(config.transforms):
         settings = transform.settings
         if transform.type == "mapping":
             result = map_record(result, settings.get("fields", {}))
@@ -115,8 +135,12 @@ def _transform_record(row: dict[str, Any], config: PipelineConfig) -> dict[str, 
         elif transform.type == "cpu_fingerprint":
             value = result.get(str(settings["field"]))
             if isinstance(value, (int, float)):
-                result[str(settings.get("output_field", "fingerprint"))] = _fingerprint_fast(
-                    int(value), int(settings.get("rounds", 1000))
+                rounds = int(settings.get("rounds", 1000))
+                executor = (fingerprint_executors or {}).get(stage)
+                result[str(settings.get("output_field", "fingerprint"))] = (
+                    executor.apply(int(value), rounds)
+                    if executor is not None
+                    else _fingerprint_fast(int(value), rounds)
                 )
     return result
 
@@ -131,8 +155,12 @@ async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[An
             yield item
 
 
-async def _run_pipeline_unlocked(
-    config: PipelineConfig, fail_fast: bool = False, dry_run: bool = False
+async def _execute_pipeline(
+    config: PipelineConfig,
+    fail_fast: bool,
+    dry_run: bool,
+    transform_state: DiskTransformProcessor | None,
+    fingerprint_executors: Mapping[int, FingerprintExecutor],
 ) -> dict[str, Any]:
     """Run all sources concurrently; checkpoints advance only after sinks commit."""
     started = datetime.now(UTC)
@@ -150,7 +178,8 @@ async def _run_pipeline_unlocked(
     state = Checkpoint(config.checkpoint, _config_signature(config)) if config.checkpoint else None
     cursors = state.load() if state else {}
     streaming = all(
-        transform.type in {"mapping", "filtering", "cpu_fingerprint"}
+        transform.type
+        in {"mapping", "filtering", "cpu_fingerprint", "deduplication", "aggregation"}
         for transform in config.transforms
     )
     output_root = Path(config.sink.output_dir).resolve()
@@ -161,7 +190,18 @@ async def _run_pipeline_unlocked(
     )
     if committer is not None:
         cursors = committer.cursors
+        if (
+            transform_state is not None
+            and committer.manifest["batches"]
+            and not committer.has_committed_transform_state()
+        ):
+            raise ValueError(
+                "cannot safely resume this stateful pipeline from a legacy output journal; "
+                "the previous deduplication/aggregation state was not persisted"
+            )
         committer.begin_run(run_id)
+        if transform_state is not None:
+            transform_state.restore(committer.committed_transform_updates())
     instances = {name: _source(item, cursors) for name, item in source_configs.items()}
     completed: set[str] = set()
     sink = (
@@ -177,14 +217,28 @@ async def _run_pipeline_unlocked(
 
     async def flush_stream_batch() -> None:
         nonlocal stream_batch_raw_count
-        if not stream_batch and not stream_dead and not stream_batch_position:
+        state_updates = transform_state.pending_updates() if transform_state is not None else []
+        if (
+            transform_state is not None
+            and not state_updates
+            and (stream_batch or stream_dead or stream_batch_position or stream_batch_raw_count)
+        ):
+            state_updates = [{"op": "version", "version": 1}]
+        if not stream_batch and not stream_dead and not stream_batch_position and not state_updates:
             return
         if committer is not None:
             written.extend(
-                await asyncio.to_thread(
-                    committer.commit_batch, stream_batch, stream_dead, stream_batch_position, sink
+                await _blocking_to_completion(
+                    committer.commit_batch,
+                    stream_batch,
+                    stream_dead,
+                    stream_batch_position,
+                    sink,
+                    state_updates,
                 )
             )
+            if transform_state is not None:
+                transform_state.clear_pending()
         stream_batch.clear()
         stream_dead.clear()
         stream_batch_position.clear()
@@ -256,7 +310,11 @@ async def _run_pipeline_unlocked(
                         )
                         valid_count += 1
                         if streaming:
-                            transformed = _transform_record(record, config)
+                            transformed = (
+                                transform_state.process(record, fingerprint_executors=fingerprint_executors)
+                                if transform_state is not None
+                                else _transform_record(record, config, fingerprint_executors)
+                            )
                             if transformed is not None:
                                 stream_batch.append(transformed)
                                 streamed_record_count += 1
@@ -300,8 +358,33 @@ async def _run_pipeline_unlocked(
                 stream_batch_position[name] = cursor_value
         await flush_stream_batch()
 
+    if transform_state is not None and committer is not None:
+        for stage, transform in enumerate(config.transforms):
+            if transform.type != "aggregation":
+                continue
+            last_day, done = transform_state.progress(stage)
+            if done:
+                continue
+            date_field = str(transform.settings.get("date_field", "date"))
+            processed = 0
+            for aggregate in transform_state.aggregate_rows(stage, date_field, last_day):
+                transformed = transform_state.process(
+                    aggregate, stage + 1, fingerprint_executors
+                )
+                if transformed is not None:
+                    stream_batch.append(transformed)
+                    streamed_record_count += 1
+                transform_state.set_progress(stage, str(aggregate[date_field]))
+                processed += 1
+                if processed >= config.sink.batch_size:
+                    await flush_stream_batch()
+                    processed = 0
+            final_day, _ = transform_state.progress(stage)
+            transform_state.set_progress(stage, final_day, True)
+            await flush_stream_batch()
+
     records: list[dict[str, Any]] = valid
-    duplicates = 0
+    duplicates = transform_state.duplicates if transform_state is not None else 0
     for transform in (() if streaming else config.transforms):
         settings = transform.settings
         if transform.type == "mapping":
@@ -345,10 +428,12 @@ async def _run_pipeline_unlocked(
             if getattr(instances[name], "cursor", None) is not None
         }
         written.extend(
-            await asyncio.to_thread(committer.commit_batch, records, dead, final_cursors, sink)
+            await _blocking_to_completion(
+                committer.commit_batch, records, dead, final_cursors, sink
+            )
         )
     if committer is not None:
-        await asyncio.to_thread(committer.materialize_dead_letters)
+        await _blocking_to_completion(committer.materialize_dead_letters)
 
     duration = time.perf_counter() - clock
     report: dict[str, Any] = {
@@ -373,6 +458,41 @@ async def _run_pipeline_unlocked(
     if committer is not None:
         committer.complete_run(run_id)
     return report
+
+
+async def _run_pipeline_unlocked(
+    config: PipelineConfig, fail_fast: bool = False, dry_run: bool = False
+) -> dict[str, Any]:
+    """Create and always clean disposable on-disk transformation state."""
+    stateful = any(
+        transform.type in {"deduplication", "aggregation"} for transform in config.transforms
+    )
+    transform_state = (
+        DiskTransformProcessor(Path(config.sink.output_dir), config.transforms)
+        if stateful and not dry_run
+        else None
+    )
+    fingerprint_executors: dict[int, FingerprintExecutor] = {}
+    try:
+        if not dry_run:
+            for stage, transform in enumerate(config.transforms):
+                if transform.type != "cpu_fingerprint":
+                    continue
+                expected = transform.settings.get("expected_records")
+                fingerprint_executors[stage] = FingerprintExecutor(
+                    cast(ExecutionMode, str(transform.settings.get("execution", "auto"))),
+                    int(transform.settings.get("workers", config.concurrency)),
+                    int(expected) if expected is not None else None,
+                    int(transform.settings.get("rounds", 1000)),
+                )
+        return await _execute_pipeline(
+            config, fail_fast, dry_run, transform_state, fingerprint_executors
+        )
+    finally:
+        if transform_state is not None:
+            transform_state.close()
+        for executor in fingerprint_executors.values():
+            executor.close()
 
 
 async def run_pipeline(
