@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache
 from typing import Any
 
 
@@ -62,7 +63,7 @@ def _normalize_global(task: tuple[list[dict[str, Any]], str, float, float]) -> l
 
 def _fingerprint_chunk(task: tuple[list[int], int]) -> list[int]:
     values, rounds = task
-    return [_fingerprint(value, rounds) for value in values]
+    return [_fingerprint_fast(value, rounds) for value in values]
 
 
 def _fingerprint(value: int, rounds: int) -> int:
@@ -70,6 +71,42 @@ def _fingerprint(value: int, rounds: int) -> int:
     for counter in range(rounds):
         state = (state * 1_664_525 + 1_013_904_223 + counter) & 0xFFFFFFFF
     return state
+
+
+def _compose(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    """Compose affine counter segments modulo 2**32: second(first(state))."""
+    a, c, d, length = first
+    e, f, g, second_length = second
+    mask = 0xFFFFFFFF
+    return (
+        (e * a) & mask,
+        (e * c + f + g * length) & mask,
+        (e * d + g) & mask,
+        length + second_length,
+    )
+
+
+@lru_cache(maxsize=128)
+def _fingerprint_coefficients(rounds: int) -> tuple[int, int]:
+    """Return exact affine coefficients for the legacy iterative fingerprint."""
+    if rounds < 1:
+        raise ValueError("rounds must be positive")
+    result = (1, 0, 0, 0)
+    segment = (1_664_525, 1_013_904_223, 1, 1)
+    remaining = rounds
+    while remaining:
+        if remaining & 1:
+            result = _compose(result, segment)
+        segment = _compose(segment, segment)
+        remaining >>= 1
+    return result[0], result[1]
+
+
+def _fingerprint_fast(value: int, rounds: int) -> int:
+    multiplier, offset = _fingerprint_coefficients(rounds)
+    return (multiplier * (value & 0xFFFFFFFF) + offset) & 0xFFFFFFFF
 
 
 def fingerprint_records(
@@ -83,7 +120,7 @@ def fingerprint_records(
         row = dict(source)
         value = row.get(field)
         if isinstance(value, (int, float)):
-            row[output_field] = _fingerprint(int(value), rounds)
+            row[output_field] = _fingerprint_fast(int(value), rounds)
         result.append(row)
     return result
 

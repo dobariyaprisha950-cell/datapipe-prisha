@@ -417,6 +417,39 @@ async def test_record_local_mapping_and_filtering_use_batched_stream_path(
 
 
 @pytest.mark.asyncio
+async def test_fingerprint_transform_uses_batched_stream_path(tmp_path: Path) -> None:
+    from datapipe.transforms.parallel import _fingerprint
+
+    source = tmp_path / "fingerprint.jsonl"
+    source.write_text(
+        '{"id":"one","date":"2026-01-01","value":42}\n'
+        '{"id":"two","date":"2026-01-02","value":-7}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "fingerprint-stream",
+            "sources": [{"name": "input", "type": "jsonl", "path": str(source)}],
+            "transforms": [
+                {
+                    "type": "cpu_fingerprint",
+                    "settings": {"field": "value", "output_field": "fp", "rounds": 5000},
+                }
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 1},
+        }
+    )
+    result = await run_pipeline(config)
+    assert result["records_written"] == 2
+    rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(output.glob("date=*/part-*.jsonl"))
+    ]
+    assert [row["fp"] for row in rows] == [_fingerprint(42, 5000), _fingerprint(-7, 5000)]
+
+
+@pytest.mark.asyncio
 async def test_two_million_jsonl_rows_stream_with_bounded_process_rss(tmp_path: Path) -> None:
     import threading
 

@@ -5,7 +5,17 @@ from datapipe.transforms.aggregation import aggregate_daily
 from datapipe.transforms.deduplication import deduplicate
 from datapipe.transforms.filtering import filter_records
 from datapipe.transforms.mapping import map_record
-from datapipe.transforms.parallel import fingerprint_records, fingerprint_records_parallel
+from datapipe.transforms.parallel import (
+    _fingerprint,
+    _fingerprint_fast,
+    fingerprint_records,
+    fingerprint_records_parallel,
+)
+
+
+@given(st.sampled_from([-999, 0, 1, 2**31, 2**40]), st.sampled_from([1, 2, 40, 1000, 5000]))
+def test_fast_fingerprint_is_exactly_compatible(value, rounds):
+    assert _fingerprint_fast(value, rounds) == _fingerprint(value, rounds)
 
 
 def test_mapping():

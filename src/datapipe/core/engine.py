@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from datapipe.config.schema import PipelineConfig, SourceConfig
 from datapipe.core.checkpoint import Checkpoint
 from datapipe.core.commit import OutputCommitter
+from datapipe.core.locking import OutputDirectoryLock, OutputLockTimeout
 from datapipe.models.records import Record
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
@@ -33,7 +34,7 @@ from datapipe.transforms.aggregation import aggregate_daily
 from datapipe.transforms.deduplication import deduplicate
 from datapipe.transforms.filtering import filter_records
 from datapipe.transforms.mapping import map_record
-from datapipe.transforms.parallel import fingerprint_records_parallel
+from datapipe.transforms.parallel import _fingerprint_fast, fingerprint_records_parallel
 
 log = logging.getLogger("datapipe")
 
@@ -111,6 +112,12 @@ def _transform_record(row: dict[str, Any], config: PipelineConfig) -> dict[str, 
             if selected is None:
                 return None
             result = dict(selected)
+        elif transform.type == "cpu_fingerprint":
+            value = result.get(str(settings["field"]))
+            if isinstance(value, (int, float)):
+                result[str(settings.get("output_field", "fingerprint"))] = _fingerprint_fast(
+                    int(value), int(settings.get("rounds", 1000))
+                )
     return result
 
 
@@ -124,7 +131,7 @@ async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[An
             yield item
 
 
-async def run_pipeline(
+async def _run_pipeline_unlocked(
     config: PipelineConfig, fail_fast: bool = False, dry_run: bool = False
 ) -> dict[str, Any]:
     """Run all sources concurrently; checkpoints advance only after sinks commit."""
@@ -142,7 +149,10 @@ async def run_pipeline(
     source_configs = {item.name: item for item in config.sources}
     state = Checkpoint(config.checkpoint, _config_signature(config)) if config.checkpoint else None
     cursors = state.load() if state else {}
-    streaming = all(transform.type in {"mapping", "filtering"} for transform in config.transforms)
+    streaming = all(
+        transform.type in {"mapping", "filtering", "cpu_fingerprint"}
+        for transform in config.transforms
+    )
     output_root = Path(config.sink.output_dir).resolve()
     committer = (
         OutputCommitter(output_root, _config_signature(config), state, cursors)
@@ -363,3 +373,24 @@ async def run_pipeline(
     if committer is not None:
         committer.complete_run(run_id)
     return report
+
+
+async def run_pipeline(
+    config: PipelineConfig, fail_fast: bool = False, dry_run: bool = False
+) -> dict[str, Any]:
+    """Run one pipeline while excluding other writers to its output directory."""
+    if dry_run:
+        return await _run_pipeline_unlocked(config, fail_fast, True)
+    root = Path(config.sink.output_dir).resolve()
+    lock = OutputDirectoryLock(root)
+    deadline = time.monotonic() + lock.timeout
+    while not lock.try_acquire():
+        if time.monotonic() >= deadline:
+            raise OutputLockTimeout(
+                f"timed out after {lock.timeout:g}s waiting for output lock {lock.path}"
+            )
+        await asyncio.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+    try:
+        return await _run_pipeline_unlocked(config, fail_fast, False)
+    finally:
+        lock.release()
