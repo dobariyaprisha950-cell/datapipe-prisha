@@ -1,0 +1,22 @@
+name: datapipe-demo
+checkpoint: work/demo-checkpoint.json
+sources:
+  - name: sales-csv
+    type: csv
+    path: examples/data/sales.csv
+  - name: supplement-jsonl
+    type: jsonl
+    path: examples/data/supplement.jsonl
+transforms:
+  - type: mapping
+    settings:
+      fields:
+        amount: value
+  - type: deduplication
+    settings:
+      key: id
+sink:
+  type: jsonl
+  output_dir: work/demo-output
+  partition_by: date
+  batch_size: 2

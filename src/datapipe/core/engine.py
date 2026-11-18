@@ -6,8 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
-import tempfile
 import time
 import uuid
 from collections import Counter
@@ -21,6 +19,7 @@ from pydantic import ValidationError
 
 from datapipe.config.schema import PipelineConfig, SourceConfig
 from datapipe.core.checkpoint import Checkpoint
+from datapipe.core.commit import OutputCommitter
 from datapipe.models.records import Record
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
@@ -61,6 +60,13 @@ def _source(config: SourceConfig, saved: dict[str, Any]) -> Any:
         )
     if config.type == "http":
         cursor = saved.get(config.name, config.start_page)
+        if isinstance(cursor, dict):
+            start_page = int(cursor.get("page", config.start_page))
+            start_offset = int(cursor.get("offset", 0))
+        else:
+            # Version-one checkpoints stored only the next page integer.
+            start_page = int(cursor)
+            start_offset = 0
         return HTTPSource(
             config.name,
             config.url or "",
@@ -68,16 +74,44 @@ def _source(config: SourceConfig, saved: dict[str, Any]) -> Any:
             config.retries,
             config.auth_env,
             config.page_param,
-            int(cursor),
+            start_page,
             config.items_key,
+            start_offset,
         )
     discover()
     settings = {**config.settings, "name": config.name}
+    if config.name in saved:
+        settings.setdefault("cursor", saved[config.name])
     if config.path is not None:
         settings.setdefault("path", config.path)
     if config.url is not None:
         settings.setdefault("url", config.url)
     return SourceRegistry.create(config.type, **settings)
+
+
+def _transform_record(row: dict[str, Any], config: PipelineConfig) -> dict[str, Any] | None:
+    """Apply the order-preserving, record-local transformation subset."""
+    result = row
+    for transform in config.transforms:
+        settings = transform.settings
+        if transform.type == "mapping":
+            result = map_record(result, settings.get("fields", {}))
+        elif transform.type == "filtering":
+            selected = next(
+                iter(
+                    filter_records(
+                        [result],
+                        str(settings["field"]),
+                        str(settings["op"]),
+                        settings.get("value"),
+                    )
+                ),
+                None,
+            )
+            if selected is None:
+                return None
+            result = dict(selected)
+    return result
 
 
 async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[Any]:
@@ -88,25 +122,6 @@ async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[An
     else:
         async for item in source.read():
             yield item
-
-
-def _atomic_dead_letter(path: Path, rows: list[dict[str, Any]]) -> None:
-    """Replace the dead-letter file as one same-directory atomic rename."""
-    fd, temporary = tempfile.mkstemp(prefix=".dead-letter-", dir=path.parent, text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            if path.exists():
-                with path.open(encoding="utf-8") as previous:
-                    for line in previous:
-                        stream.write(line)
-            for row in rows:
-                stream.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 async def run_pipeline(
@@ -120,15 +135,25 @@ async def run_pipeline(
     counts: Counter[str] = Counter()
     valid: list[dict[str, Any]] = []
     valid_count = 0
+    streamed_record_count = 0
     dead: list[dict[str, Any]] = []
+    dead_count = 0
     errors: list[dict[str, str]] = []
     source_configs = {item.name: item for item in config.sources}
     state = Checkpoint(config.checkpoint, _config_signature(config)) if config.checkpoint else None
     cursors = state.load() if state else {}
+    streaming = all(transform.type in {"mapping", "filtering"} for transform in config.transforms)
+    output_root = Path(config.sink.output_dir).resolve()
+    committer = (
+        OutputCommitter(output_root, _config_signature(config), state, cursors)
+        if not dry_run
+        else None
+    )
+    if committer is not None:
+        cursors = committer.cursors
+        committer.begin_run(run_id)
     instances = {name: _source(item, cursors) for name, item in source_configs.items()}
     completed: set[str] = set()
-    streaming = not config.transforms
-    output_root = Path(config.sink.output_dir).resolve()
     sink = (
         JSONLSink(str(output_root), config.sink.partition_by)
         if config.sink.type == "jsonl"
@@ -136,20 +161,24 @@ async def run_pipeline(
     )
     written: list[Path] = []
     stream_batch: list[dict[str, Any]] = []
+    stream_dead: list[dict[str, Any]] = []
     stream_batch_position: dict[str, Any] = {}
-    batch_number = 0
+    stream_batch_raw_count = 0
 
     async def flush_stream_batch() -> None:
-        nonlocal batch_number
-        if not stream_batch:
+        nonlocal stream_batch_raw_count
+        if not stream_batch and not stream_dead and not stream_batch_position:
             return
-        batch_number += 1
-        batch_id = f"{config.name}-{batch_number}-" + "-".join(
-            f"{name}:{stream_batch_position[name]}" for name in sorted(stream_batch_position)
-        )
-        written.extend(await asyncio.to_thread(sink.write, stream_batch, batch_id=batch_id))
+        if committer is not None:
+            written.extend(
+                await asyncio.to_thread(
+                    committer.commit_batch, stream_batch, stream_dead, stream_batch_position, sink
+                )
+            )
         stream_batch.clear()
+        stream_dead.clear()
         stream_batch_position.clear()
+        stream_batch_raw_count = 0
 
     session_timeout = aiohttp.ClientTimeout(total=max(s.timeout for s in config.sources))
     connector = aiohttp.TCPConnector(limit=config.concurrency, limit_per_host=config.concurrency)
@@ -180,7 +209,7 @@ async def run_pipeline(
                 await queue.put(None)
 
     async def consumer() -> None:
-        nonlocal valid_count
+        nonlocal valid_count, dead_count, streamed_record_count, stream_batch_raw_count
         finished = 0
         while finished < len(instances):
             entry = await queue.get()
@@ -190,9 +219,13 @@ async def run_pipeline(
                     continue
                 name, raw, source_cursor = entry
                 counts[name] += 1
+                if streaming:
+                    stream_batch_raw_count += 1
+                    if source_cursor is not None:
+                        stream_batch_position[name] = source_cursor
                 reason = raw.get("__datapipe_error__") if isinstance(raw, dict) else None
                 if reason is not None:
-                    dead.append(
+                    rejected = (
                         {
                             "source": name,
                             "record": reason.get("input", raw),
@@ -201,33 +234,44 @@ async def run_pipeline(
                             "details": reason,
                         }
                     )
-                    continue
-                try:
-                    record = Record.model_validate(raw).model_dump(mode="json", exclude_none=True)
-                    valid_count += 1
                     if streaming:
-                        stream_batch.append(record)
-                        if source_cursor is not None:
-                            stream_batch_position[name] = source_cursor
-                        if len(stream_batch) >= config.sink.batch_size:
-                            await flush_stream_batch()
+                        stream_dead.append(rejected)
                     else:
-                        valid.append(record)
-                except (ValidationError, TypeError, ValueError) as exc:
-                    details = (
-                        exc.errors(include_url=False)
-                        if isinstance(exc, ValidationError)
-                        else str(exc)
-                    )
-                    dead.append(
-                        {
+                        dead.append(rejected)
+                    dead_count += 1
+                else:
+                    try:
+                        record = Record.model_validate(raw).model_dump(
+                            mode="json", exclude_none=True
+                        )
+                        valid_count += 1
+                        if streaming:
+                            transformed = _transform_record(record, config)
+                            if transformed is not None:
+                                stream_batch.append(transformed)
+                                streamed_record_count += 1
+                        else:
+                            valid.append(record)
+                    except (ValidationError, TypeError, ValueError) as exc:
+                        details = (
+                            exc.errors(include_url=False)
+                            if isinstance(exc, ValidationError)
+                            else str(exc)
+                        )
+                        rejected = {
                             "source": name,
                             "record": raw,
                             "timestamp": datetime.now(UTC).isoformat(),
                             "error": str(exc),
                             "details": details,
                         }
-                    )
+                        if streaming:
+                            stream_dead.append(rejected)
+                        else:
+                            dead.append(rejected)
+                        dead_count += 1
+                if streaming and stream_batch_raw_count >= config.sink.batch_size:
+                    await flush_stream_batch()
             finally:
                 queue.task_done()
 
@@ -240,11 +284,15 @@ async def run_pipeline(
             group.create_task(producer(name, source), name=f"datapipe-source-{name}")
 
     if streaming and not dry_run:
+        for name in completed:
+            cursor_value = getattr(instances[name], "cursor", None)
+            if cursor_value is not None:
+                stream_batch_position[name] = cursor_value
         await flush_stream_batch()
 
     records: list[dict[str, Any]] = valid
     duplicates = 0
-    for transform in config.transforms:
+    for transform in (() if streaming else config.transforms):
         settings = transform.settings
         if transform.type == "mapping":
             records = [map_record(row, settings.get("fields", {})) for row in records]
@@ -280,11 +328,17 @@ async def run_pipeline(
             "transforms": len(config.transforms),
         }
 
-    output_root.mkdir(parents=True, exist_ok=True)
-    if not streaming:
-        written.extend(await asyncio.to_thread(sink.write, records))
-    if dead:
-        _atomic_dead_letter(output_root / "dead-letter.jsonl", dead)
+    if not streaming and committer is not None:
+        final_cursors = {
+            name: instances[name].cursor
+            for name in completed
+            if getattr(instances[name], "cursor", None) is not None
+        }
+        written.extend(
+            await asyncio.to_thread(committer.commit_batch, records, dead, final_cursors, sink)
+        )
+    if committer is not None:
+        await asyncio.to_thread(committer.materialize_dead_letters)
 
     duration = time.perf_counter() - clock
     report: dict[str, Any] = {
@@ -294,9 +348,9 @@ async def run_pipeline(
         "finished_at": datetime.now(UTC),
         "total_fetched": sum(counts.values()),
         "valid_records": valid_count,
-        "invalid_records": len(dead),
+        "invalid_records": dead_count,
         "duplicates_removed": duplicates,
-        "records_written": valid_count if streaming else len(records),
+        "records_written": streamed_record_count if streaming else len(records),
         "records_per_source": {name: counts[name] for name in source_configs},
         "source_errors": errors,
         "duration_seconds": duration,
@@ -306,11 +360,6 @@ async def run_pipeline(
         },
     }
     write_report(output_root / "summary.json", report)
-    # Commit the resume point only after data, dead letters and summary are durable.
-    if state:
-        for name in completed:
-            cursor_value = getattr(instances[name], "cursor", None)
-            if cursor_value is not None:
-                cursors[name] = cursor_value
-        state.save(cursors)
+    if committer is not None:
+        committer.complete_run(run_id)
     return report

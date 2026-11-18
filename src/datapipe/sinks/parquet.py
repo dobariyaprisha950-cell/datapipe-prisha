@@ -43,6 +43,9 @@ class ParquetSink:
             os.close(fd)
             try:
                 pq.write_table(pa.Table.from_pylist([dict(r) for r in rows]), name)
+                with open(name, "rb+") as parquet_file:
+                    parquet_file.flush()
+                    os.fsync(parquet_file.fileno())
                 os.replace(name, target)
             finally:
                 if os.path.exists(name):

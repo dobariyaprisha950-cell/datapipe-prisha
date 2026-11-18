@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from aiohttp import web
@@ -10,6 +11,7 @@ from datapipe.config.schema import PipelineConfig
 from datapipe.core.engine import run_pipeline
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
+from datapipe.sinks.jsonl import JSONLSink
 from datapipe.sources.jsonl import JSONLSource
 
 
@@ -47,6 +49,18 @@ class SlowCancellationSource:
                 yield {"id": "slow", "date": "2026-01-01"}
         finally:
             type(self).closed = True
+
+
+class ResumableIntegrationSource:
+    def __init__(
+        self, name: str, records: list[dict[str, object]], cursor: int = 0
+    ) -> None:
+        self.name, self.records, self.cursor = name, records, cursor
+
+    async def read(self) -> AsyncIterator[dict[str, object]]:
+        for index in range(self.cursor, len(self.records)):
+            self.cursor = index + 1
+            yield self.records[index]
 
 
 @pytest.mark.asyncio
@@ -173,7 +187,10 @@ async def test_http_page_checkpoint_resumes_after_successful_output(tmp_path: Pa
         await runner.cleanup()
     assert first["records_written"] == 1 and second["total_fetched"] == 0
     assert requests == [1, 2, 2]
-    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["api"] == 2
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["api"] == {
+        "page": 2,
+        "offset": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -267,6 +284,56 @@ async def test_discovered_entrypoint_plugin_executes(
 
 
 @pytest.mark.asyncio
+async def test_resumable_plugin_receives_committed_cursor_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    SourceRegistry.register("resumable-test", ResumableIntegrationSource)
+    config = PipelineConfig.model_validate(
+        {
+            "name": "resumable-plugin",
+            "sources": [
+                {
+                    "name": "plugin",
+                    "type": "resumable-test",
+                    "settings": {
+                        "records": [
+                            {"id": "plugin-a", "date": "2026-01-01"},
+                            {"id": "plugin-b", "date": "2026-01-02"},
+                        ]
+                    },
+                }
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out"), "batch_size": 1},
+            "checkpoint": str(tmp_path / "checkpoint.json"),
+        }
+    )
+    original = JSONLSink.write
+    writes = 0
+
+    def fail_second_batch(
+        self: JSONLSink, records: Any, batch_id: str | None = None
+    ) -> list[Path]:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("injected plugin batch failure")
+        return original(self, records, batch_id)
+
+    monkeypatch.setattr(JSONLSink, "write", fail_second_batch)
+    with pytest.raises(ExceptionGroup):
+        await run_pipeline(config)
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["cursors"]["plugin"] == 1
+
+    monkeypatch.setattr(JSONLSink, "write", original)
+    report = await run_pipeline(config)
+    assert report["records_written"] == 1
+    output = list((tmp_path / "out").glob("date=*/part-*.jsonl"))
+    ids = [json.loads(part.read_text(encoding="utf-8"))["id"] for part in output]
+    assert sorted(ids) == ["plugin-a", "plugin-b"]
+
+
+@pytest.mark.asyncio
 async def test_dry_run_does_not_create_output(tmp_path: Path) -> None:
     source_file = tmp_path / "in.jsonl"
     source_file.write_text('{"id":"one","date":"2026-01-01"}\n', encoding="utf-8")
@@ -316,6 +383,40 @@ async def test_all_configured_transforms_run_in_order(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_local_mapping_and_filtering_use_batched_stream_path(
+    tmp_path: Path,
+) -> None:
+    source_file = tmp_path / "record-local.jsonl"
+    source_file.write_text(
+        '{"id":"keep","date":"2026-01-01","amount":5}\n'
+        '{"id":"drop","date":"2026-01-01","amount":1}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "record-local",
+            "sources": [{"name": "input", "type": "jsonl", "path": str(source_file)}],
+            "transforms": [
+                {"type": "mapping", "settings": {"fields": {"amount": "value"}}},
+                {"type": "filtering", "settings": {"field": "value", "op": "gt", "value": 2}},
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 1},
+        }
+    )
+    report = await run_pipeline(config)
+    assert report["valid_records"] == 2
+    assert report["records_written"] == 1
+    part = next(output.glob("date=*/part-*.jsonl"))
+    assert json.loads(part.read_text(encoding="utf-8")) == {
+        "id": "keep",
+        "date": "2026-01-01",
+        "value": 5,
+        "data": {},
+    }
+
+
+@pytest.mark.asyncio
 async def test_two_million_jsonl_rows_stream_with_bounded_process_rss(tmp_path: Path) -> None:
     import threading
 
@@ -345,6 +446,10 @@ async def test_two_million_jsonl_rows_stream_with_bounded_process_rss(tmp_path: 
         {
             "name": "two-million-stream",
             "sources": [{"name": "large", "type": "jsonl", "path": str(source_file)}],
+            "transforms": [
+                {"type": "mapping", "settings": {"fields": {"value": "amount"}}},
+                {"type": "filtering", "settings": {"field": "amount", "op": "ge", "value": 0}},
+            ],
             "sink": {
                 "type": "jsonl",
                 "output_dir": str(output),

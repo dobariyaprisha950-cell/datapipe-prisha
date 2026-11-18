@@ -22,6 +22,7 @@ class HTTPSource:
         page_param: str | None = None,
         start_page: int = 1,
         items_key: str | None = None,
+        start_offset: int = 0,
     ) -> None:
         (
             self.name,
@@ -33,7 +34,8 @@ class HTTPSource:
             self.start_page,
             self.items_key,
         ) = name, url, timeout, retries, auth_env, page_param, start_page, items_key
-        self.cursor = start_page
+        self.start_offset = start_offset
+        self.cursor: dict[str, int] = {"page": start_page, "offset": start_offset}
 
     async def read(
         self, session: aiohttp.ClientSession | None = None
@@ -41,6 +43,7 @@ class HTTPSource:
         own = session is None
         client = session or aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout))
         page = self.start_page
+        offset = self.start_offset
         try:
             while True:
                 params = {self.page_param: page} if self.page_param else None
@@ -89,8 +92,12 @@ class HTTPSource:
                 else:
                     raise SourceError(f"{self.name}: expected JSON object or array")
                 if not items:
+                    self.cursor = {"page": page, "offset": 0}
                     break
-                for item in items:
+                for index, item in enumerate(items):
+                    if index < offset:
+                        continue
+                    self.cursor = {"page": page, "offset": index + 1}
                     if isinstance(item, dict):
                         yield item
                     else:
@@ -103,7 +110,8 @@ class HTTPSource:
                 if not self.page_param or len(items) == 0:
                     break
                 page += 1
-                self.cursor = page
+                offset = 0
+                self.cursor = {"page": page, "offset": 0}
         except (TimeoutError, aiohttp.ClientError, ValueError) as exc:
             raise SourceError(f"{self.name}: {type(exc).__name__}: {exc}") from exc
         finally:

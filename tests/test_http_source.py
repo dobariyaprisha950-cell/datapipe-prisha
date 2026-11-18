@@ -41,7 +41,7 @@ async def test_pagination_and_environment_auth(monkeypatch: pytest.MonkeyPatch) 
         source = HTTPSource("api", url, auth_env="DATAPIPE_TEST_TOKEN", page_param="page")
         result = [row async for row in source.read()]
         assert [row["id"] for row in result] == ["1", "2"]
-        assert source.cursor == 3
+        assert source.cursor == {"page": 3, "offset": 0}
 
     await with_server(handler, check)
     assert seen == [1, 2, 3]

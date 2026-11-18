@@ -21,6 +21,12 @@ app = typer.Typer(
 )
 
 
+class _SignalTermination(Exception):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        super().__init__(f"received signal {signum}")
+
+
 def _logging(level: str) -> None:
     handler = logging.StreamHandler()
     handler.addFilter(RedactionFilter())
@@ -45,10 +51,13 @@ async def _run_with_signals(config_path: Path, fail_fast: bool, dry_run: bool) -
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     previous: dict[signal.Signals, Any] = {}
+    received_signal: int | None = None
     if task is None:
         raise RuntimeError("pipeline runner must execute in an asyncio task")
 
     def request_cancel(_number: int, _frame: Any) -> None:
+        nonlocal received_signal
+        received_signal = _number
         loop.call_soon_threadsafe(task.cancel)
 
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -67,6 +76,10 @@ async def _run_with_signals(config_path: Path, fail_fast: bool, dry_run: bool) -
         _logging(config.log_level)
         try:
             return await run_pipeline(config, fail_fast, dry_run)
+        except asyncio.CancelledError:
+            if received_signal is None:
+                raise
+            raise _SignalTermination(received_signal) from None
         finally:
             logger.handlers.clear()
             logger.handlers.extend(handlers)
@@ -113,6 +126,8 @@ def run(
     """Execute a configured data pipeline."""
     try:
         result = asyncio.run(_run_with_signals(path, fail_fast, dry_run))
+    except _SignalTermination as exc:
+        raise typer.Exit(128 + exc.signum) from None
     except (ConfigurationError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc

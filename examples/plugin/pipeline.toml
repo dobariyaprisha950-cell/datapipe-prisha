@@ -1,0 +1,8 @@
+name = "datapipe-sample-plugin-demo"
+[[sources]]
+name = "external-sample"
+type = "sample"
+[sink]
+type = "jsonl"
+output_dir = "work/plugin-demo-output"
+partition_by = "date"
