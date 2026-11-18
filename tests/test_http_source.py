@@ -8,8 +8,10 @@ from datapipe.core.exceptions import SourceError
 from datapipe.sources.http import HTTPSource
 
 
-async def with_server(handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
-                      check: Callable[[str], Awaitable[None]]) -> None:
+async def with_server(
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    check: Callable[[str], Awaitable[None]],
+) -> None:
     app = web.Application()
     app.router.add_get("/data", handler)
     runner = web.AppRunner(app)

@@ -1,6 +1,10 @@
 """Pydantic configuration models."""
+
 from typing import Any, Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
 class SourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
@@ -34,14 +38,20 @@ class SourceConfig(BaseModel):
         if self.start_page < 1:
             raise ValueError("start_page must be >= 1")
         return self
+
+
 class TransformConfig(BaseModel):
-    type: Literal["mapping", "filtering", "deduplication", "aggregation"]
+    type: Literal["mapping", "filtering", "deduplication", "aggregation", "cpu_fingerprint"]
     settings: dict[str, Any] = Field(default_factory=dict)
+
+
 class SinkConfig(BaseModel):
     type: Literal["jsonl", "parquet"] = "jsonl"
     output_dir: str
     partition_by: str = "date"
     batch_size: int = Field(default=1000, gt=0)
+
+
 class PipelineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str

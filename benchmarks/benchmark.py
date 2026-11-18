@@ -1,23 +1,126 @@
 """Reproducible normalizer benchmark; results are printed, never prefilled."""
-import argparse,json,time,threading
+
+import argparse
+import hashlib
+import json
+import platform
+import statistics
+import threading
+import time
+
 import psutil
-from datapipe.transforms.parallel import normalize,normalize_parallel
-def main()->None:
- p=argparse.ArgumentParser();p.add_argument("--records",type=int,default=200_000);p.add_argument("--workers",type=int,default=4);a=p.parse_args()
- rows=[{"value":float(i%997)} for i in range(a.records)];results={}
- outputs={}
- process=psutil.Process();
- for name,fn in (("pure",lambda:normalize(rows,"value")),("parallel",lambda:normalize_parallel(rows,"value",a.workers))):
-  peak=[0];stop=threading.Event()
-  def sample()->None:
-   while not stop.is_set():
-    total=0
-    for proc in [process,*process.children(recursive=True)]:
-     try:total+=proc.memory_info().rss
-     except psutil.Error:pass
-    peak[0]=max(peak[0],total);stop.wait(.01)
-  sampler=threading.Thread(target=sample,daemon=True);sampler.start();start=time.perf_counter();out=fn();elapsed=time.perf_counter()-start;stop.set();sampler.join()
-  outputs[name]=out;results[name]={"seconds":elapsed,"records_per_second":len(out)/elapsed,"peak_rss_bytes_including_children":peak[0]}
- if outputs["pure"]!=outputs["parallel"]:raise RuntimeError("parallel output differed from sequential output")
- results["speedup"]=results["pure"]["seconds"]/results["parallel"]["seconds"];results["environment"]={"python":__import__("platform").python_version(),"workers":a.workers,"records":a.records};print(json.dumps(results,indent=2))
-if __name__=="__main__":main()
+
+from datapipe.transforms.parallel import fingerprint_records, fingerprint_records_parallel
+
+
+def _sample_process_tree(
+    process: psutil.Process, stats: dict[str, float], stop: threading.Event
+) -> None:
+    final_sample = False
+    while True:
+        total = 0
+        cpu_total = 0.0
+        for child in [process, *process.children(recursive=True)]:
+            try:
+                memory = child.memory_info().rss
+                cpu = child.cpu_times()
+                total += memory
+                cpu_total += cpu.user + cpu.system
+            except psutil.Error:
+                pass
+        stats["peak_rss"] = max(stats["peak_rss"], total)
+        if "cpu_start" not in stats:
+            stats["cpu_start"] = cpu_total
+        stats["cpu_seconds"] = max(0.0, cpu_total - stats["cpu_start"])
+        if final_sample:
+            return
+        final_sample = stop.wait(0.25)
+
+
+def _digest(rows: list[dict[str, object]]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":")).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--records", type=int, default=100_000)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--runs", type=int, default=3)
+    p.add_argument("--rounds", type=int, default=1000)
+    a = p.parse_args()
+    if a.records <= 0 or a.workers <= 0 or a.runs <= 0 or a.rounds <= 0:
+        p.error("records, workers, runs and rounds must be positive")
+    rows = [{"value": float(i % 997)} for i in range(a.records)]
+    timings: dict[str, list[float]] = {"pure": [], "parallel": []}
+    peak_rss: dict[str, list[float]] = {"pure": [], "parallel": []}
+    cpu_utilization: dict[str, list[float]] = {"pure": [], "parallel": []}
+    equality = True
+    process = psutil.Process()
+    for _ in range(a.runs):
+        baseline = fingerprint_records(rows, "value", "fingerprint", a.rounds)
+        baseline_digest = _digest(baseline)
+        del baseline
+        parallel = fingerprint_records_parallel(rows, "value", "fingerprint", a.rounds, a.workers)
+        equality = equality and baseline_digest == _digest(parallel)
+        del parallel
+        for name, fn in (
+            ("pure", lambda: fingerprint_records(rows, "value", "fingerprint", a.rounds)),
+            (
+                "parallel",
+                lambda: fingerprint_records_parallel(
+                    rows, "value", "fingerprint", a.rounds, a.workers
+                ),
+            ),
+        ):
+            sample: dict[str, float] = {"peak_rss": 0.0, "cpu_seconds": 0.0}
+            stop = threading.Event()
+            sampler = threading.Thread(
+                target=_sample_process_tree, args=(process, sample, stop), daemon=True
+            )
+            sampler.start()
+            start = time.perf_counter()
+            output = fn()
+            elapsed = time.perf_counter() - start
+            stop.set()
+            sampler.join()
+            del output
+            timings[name].append(elapsed)
+            peak_rss[name].append(sample["peak_rss"])
+            core_count = psutil.cpu_count(logical=True) or 1
+            cpu_utilization[name].append(sample["cpu_seconds"] / elapsed / core_count * 100)
+    if not equality:
+        raise RuntimeError("parallel output differed from sequential output")
+    medians = {name: statistics.median(values) for name, values in timings.items()}
+    results = {
+        name: {
+            "runs_seconds": timings[name],
+            "median_seconds": medians[name],
+            "median_records_per_second": a.records / medians[name],
+            "peak_rss_bytes_including_children": max(peak_rss[name]),
+            "median_cpu_utilization_percent_of_logical_capacity": statistics.median(
+                cpu_utilization[name]
+            ),
+        }
+        for name in timings
+    }
+    results["speedup_median"] = medians["pure"] / medians["parallel"]
+    results["output_equal"] = equality
+    results["environment"] = {
+        "python": platform.python_version(),
+        "os": platform.platform(),
+        "cpu": platform.processor(),
+        "logical_cpus": psutil.cpu_count(logical=True),
+        "workers": a.workers,
+        "records": a.records,
+        "runs": a.runs,
+        "rounds_per_record": a.rounds,
+    }
+    print(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+    main()

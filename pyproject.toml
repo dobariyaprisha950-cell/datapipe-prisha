@@ -13,7 +13,7 @@ authors = [{name = "Prisha"}]
 dependencies = ["aiohttp>=3.11,<4", "pydantic>=2.10,<3", "typer>=0.15,<1", "pyarrow>=18,<24", "PyYAML>=6,<7", "opentelemetry-api>=1.29,<2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]
+dev = ["pytest>=9.0.3,<10", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]
 
 [project.scripts]
 datapipe = "datapipe.cli:app"
@@ -27,10 +27,13 @@ packages = ["src/datapipe"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["work"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -39,5 +42,9 @@ mypy_path = "src"
 packages = ["datapipe"]
 plugins = ["pydantic.mypy"]
 
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*", "yaml"]
+ignore_missing_imports = true
+
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]
+dev = ["pytest>=9.0.3,<10", "pytest-asyncio>=0.25,<2", "hypothesis>=6.120,<7", "respx>=0.22,<1", "mypy>=1.14,<2", "ruff>=0.9,<1", "pytest-cov>=6,<8", "pip-audit>=2.7,<3", "psutil>=6.1,<8"]

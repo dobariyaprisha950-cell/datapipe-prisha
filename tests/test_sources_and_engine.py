@@ -1,11 +1,14 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from aiohttp import web
 
 from datapipe.config.schema import PipelineConfig
 from datapipe.core.engine import run_pipeline
+from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
 from datapipe.sources.jsonl import JSONLSource
 
@@ -31,22 +34,46 @@ class SampleIntegrationSource:
             yield record
 
 
+class SlowCancellationSource:
+    closed = False
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    async def read(self) -> AsyncIterator[dict[str, object]]:
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+                yield {"id": "slow", "date": "2026-01-01"}
+        finally:
+            type(self).closed = True
+
+
 @pytest.mark.asyncio
 async def test_installed_source_registry_plugin_runs_and_invalid_record_dead_letters(
     tmp_path: Path,
 ) -> None:
     plugin_name = "test-sample-plugin"
     SourceRegistry.register(plugin_name, SampleIntegrationSource)
-    config = PipelineConfig.model_validate({
-        "name": "plugin-check",
-        "sources": [{"name": "plug", "type": plugin_name,
-                     "settings": {"records": [
-                         {"id": "valid", "date": "2026-01-01"},
-                         {"id": "invalid", "date": False},
-                     ]}}],
-        "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
-        "checkpoint": str(tmp_path / "checkpoint.json"),
-    })
+    config = PipelineConfig.model_validate(
+        {
+            "name": "plugin-check",
+            "sources": [
+                {
+                    "name": "plug",
+                    "type": plugin_name,
+                    "settings": {
+                        "records": [
+                            {"id": "valid", "date": "2026-01-01"},
+                            {"id": "invalid", "date": False},
+                        ]
+                    },
+                }
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+            "checkpoint": str(tmp_path / "checkpoint.json"),
+        }
+    )
     result = await run_pipeline(config)
     assert result["records_written"] == 1
     assert result["invalid_records"] == 1
@@ -54,40 +81,117 @@ async def test_installed_source_registry_plugin_runs_and_invalid_record_dead_let
     row = json.loads(dead)
     assert row["source"] == "plug" and row["record"]["id"] == "invalid"
     checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
-    assert checkpoint["plug"] == 2
+    assert checkpoint["cursors"]["plug"] == 2
 
 
 @pytest.mark.asyncio
 async def test_file_checkpoint_resume_skips_committed_jsonl_rows(tmp_path: Path) -> None:
     source_file = tmp_path / "records.jsonl"
     source_file.write_text(
-        '{"id":"one","date":"2026-01-01"}\n'
-        '{"id":"two","date":"2026-01-02"}\n', encoding="utf-8")
+        '{"id":"one","date":"2026-01-01"}\n{"id":"two","date":"2026-01-02"}\n', encoding="utf-8"
+    )
     checkpoint = tmp_path / "cursor.json"
-    config = PipelineConfig.model_validate({
-        "name": "file-resume", "sources": [{"name": "file", "type": "jsonl",
-                                             "path": str(source_file)}],
-        "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
-        "checkpoint": str(checkpoint),
-    })
+    config = PipelineConfig.model_validate(
+        {
+            "name": "file-resume",
+            "sources": [{"name": "file", "type": "jsonl", "path": str(source_file)}],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+            "checkpoint": str(checkpoint),
+        }
+    )
     first = await run_pipeline(config)
     second = await run_pipeline(config)
     assert first["total_fetched"] == 2
     assert second["total_fetched"] == 0
-    assert json.loads(checkpoint.read_text(encoding="utf-8"))["file"] == 2
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["file"] == 2
+
+
+@pytest.mark.asyncio
+async def test_csv_checkpoint_resume_skips_committed_rows(tmp_path: Path) -> None:
+    source_file = tmp_path / "records.csv"
+    source_file.write_text(
+        "id,date,value\none,2026-01-01,1\ntwo,2026-01-02,2\n", encoding="utf-8"
+    )
+    checkpoint = tmp_path / "csv-checkpoint.json"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "csv-resume",
+            "sources": [{"name": "csv", "type": "csv", "path": str(source_file)}],
+            "sink": {
+                "type": "jsonl",
+                "output_dir": str(tmp_path / "out"),
+                "batch_size": 1,
+            },
+            "checkpoint": str(checkpoint),
+        }
+    )
+    first = await run_pipeline(config)
+    second = await run_pipeline(config)
+    assert first["total_fetched"] == 2 and second["total_fetched"] == 0
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["csv"] == 2
+    assert len(list((tmp_path / "out").glob("date=*/part-*.jsonl"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_http_page_checkpoint_resumes_after_successful_output(tmp_path: Path) -> None:
+    requests: list[int] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        page = int(request.query["page"])
+        requests.append(page)
+        rows = [{"id": "api-1", "date": "2026-01-01"}] if page == 1 else []
+        return web.json_response(rows)
+
+    app = web.Application()
+    app.router.add_get("/items", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]
+    checkpoint = tmp_path / "http-checkpoint.json"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "http-resume",
+            "sources": [
+                {
+                    "name": "api",
+                    "type": "http",
+                    "url": f"http://127.0.0.1:{port}/items",
+                    "page_param": "page",
+                }
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+            "checkpoint": str(checkpoint),
+        }
+    )
+    try:
+        first = await run_pipeline(config)
+        second = await run_pipeline(config)
+    finally:
+        await runner.cleanup()
+    assert first["records_written"] == 1 and second["total_fetched"] == 0
+    assert requests == [1, 2, 2]
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["api"] == 2
 
 
 @pytest.mark.asyncio
 async def test_failed_source_isolated_when_not_fail_fast(tmp_path: Path) -> None:
-    config = PipelineConfig.model_validate({
-        "name": "isolation",
-        "sources": [
-            {"name": "missing", "type": "jsonl", "path": str(tmp_path / "missing")},
-            {"name": "good", "type": "sample-isolation",
-             "settings": {"records": [{"id": "ok", "date": "2026-01-01"}]}},
-        ],
-        "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
-    })
+    config = PipelineConfig.model_validate(
+        {
+            "name": "isolation",
+            "sources": [
+                {"name": "missing", "type": "jsonl", "path": str(tmp_path / "missing")},
+                {
+                    "name": "good",
+                    "type": "sample-isolation",
+                    "settings": {"records": [{"id": "ok", "date": "2026-01-01"}]},
+                },
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+        }
+    )
     SourceRegistry.register("sample-isolation", SampleIntegrationSource)
     result = await run_pipeline(config)
     assert result["records_written"] == 1
@@ -96,10 +200,175 @@ async def test_failed_source_isolated_when_not_fail_fast(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_fail_fast_propagates_source_failure(tmp_path: Path) -> None:
-    config = PipelineConfig.model_validate({
-        "name": "fail-fast", "sources": [{"name": "missing", "type": "jsonl",
-                                               "path": str(tmp_path / "missing")}],
-        "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
-    })
+    config = PipelineConfig.model_validate(
+        {
+            "name": "fail-fast",
+            "sources": [{"name": "missing", "type": "jsonl", "path": str(tmp_path / "missing")}],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+        }
+    )
     with pytest.raises(ExceptionGroup):
         await run_pipeline(config, fail_fast=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_closes_source_and_http_session(tmp_path: Path) -> None:
+    SlowCancellationSource.closed = False
+    SourceRegistry.register("slow-cancel", SlowCancellationSource)
+    config = PipelineConfig.model_validate(
+        {
+            "name": "cancel",
+            "sources": [{"name": "slow", "type": "slow-cancel", "settings": {}}],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+        }
+    )
+    task = asyncio.create_task(run_pipeline(config))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert SlowCancellationSource.closed
+
+
+@pytest.mark.asyncio
+async def test_discovered_entrypoint_plugin_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ExampleEntryPoint:
+        name = "sample"
+
+        @staticmethod
+        def load() -> type[SampleIntegrationSource]:
+            return SampleIntegrationSource
+
+    monkeypatch.setattr(
+        "datapipe.plugins.discovery.entry_points", lambda **kwargs: [ExampleEntryPoint()]
+    )
+    assert "sample" in discover()
+    config = PipelineConfig.model_validate(
+        {
+            "name": "installed-plugin",
+            "sources": [
+                {
+                    "name": "external",
+                    "type": "sample",
+                    "settings": {
+                        "records": [{"id": "plugin-1", "date": "2026-01-01"}]
+                    },
+                }
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+        }
+    )
+    result = await run_pipeline(config)
+    assert result["records_written"] == 1
+    part = next((tmp_path / "out").glob("date=*/part-*.jsonl"))
+    assert json.loads(part.read_text(encoding="utf-8"))["id"] == "plugin-1"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_does_not_create_output(tmp_path: Path) -> None:
+    source_file = tmp_path / "in.jsonl"
+    source_file.write_text('{"id":"one","date":"2026-01-01"}\n', encoding="utf-8")
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "dry",
+            "sources": [{"name": "file", "type": "jsonl", "path": str(source_file)}],
+            "sink": {"type": "jsonl", "output_dir": str(output)},
+        }
+    )
+    result = await run_pipeline(config, dry_run=True)
+    assert result["dry_run"] is True
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_all_configured_transforms_run_in_order(tmp_path: Path) -> None:
+    source_file = tmp_path / "in.jsonl"
+    source_file.write_text(
+        '{"id":"a","date":"2026-01-01","amount":2}\n'
+        '{"id":"a","date":"2026-01-01","amount":8}\n'
+        '{"id":"b","date":"2026-01-01","amount":3}\n',
+        encoding="utf-8",
+    )
+    config = PipelineConfig.model_validate(
+        {
+            "name": "transforms",
+            "sources": [{"name": "file", "type": "jsonl", "path": str(source_file)}],
+            "transforms": [
+                {"type": "mapping", "settings": {"fields": {"amount": "value"}}},
+                {"type": "deduplication", "settings": {"key": "id"}},
+                {"type": "filtering", "settings": {"field": "value", "op": "gt", "value": 2}},
+                {
+                    "type": "aggregation",
+                    "settings": {"date_field": "date", "metrics": {"value": "sum"}},
+                },
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out")},
+        }
+    )
+    result = await run_pipeline(config)
+    assert result["duplicates_removed"] == 1
+    assert result["records_written"] == 1
+    part = next((tmp_path / "out").glob("date=*/part-*.jsonl"))
+    assert json.loads(part.read_text(encoding="utf-8"))["value_sum"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_two_million_jsonl_rows_stream_with_bounded_process_rss(tmp_path: Path) -> None:
+    import threading
+
+    import psutil
+
+    record_count = 2_000_000
+    source_file = tmp_path / "two-million.jsonl"
+    with source_file.open("w", encoding="utf-8", newline="\n") as stream:
+        for index in range(record_count):
+            stream.write(json.dumps({"id": index, "date": "2026-01-01", "value": index}))
+            stream.write("\n")
+
+    process = psutil.Process()
+    baseline = process.memory_info().rss
+    high_water = [baseline]
+    stop = threading.Event()
+
+    def sample_rss() -> None:
+        while not stop.wait(0.01):
+            high_water[0] = max(high_water[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_rss, daemon=True)
+    sampler.start()
+    checkpoint = tmp_path / "checkpoint.json"
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "two-million-stream",
+            "sources": [{"name": "large", "type": "jsonl", "path": str(source_file)}],
+            "sink": {
+                "type": "jsonl",
+                "output_dir": str(output),
+                "batch_size": 20_000,
+            },
+            "queue_size": 256,
+            "checkpoint": str(checkpoint),
+        }
+    )
+    try:
+        result = await run_pipeline(config)
+    finally:
+        stop.set()
+        sampler.join()
+    high_water[0] = max(high_water[0], process.memory_info().rss)
+
+    assert result["records_written"] == record_count
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["cursors"]["large"] == record_count
+    output_files = list(output.glob("date=*/part-*.jsonl"))
+    assert len(output_files) == record_count // 20_000
+    written_count = sum(sum(1 for _ in part.open(encoding="utf-8")) for part in output_files)
+    assert written_count == record_count
+    print(
+        f"2m records RSS baseline={baseline} bytes, peak={high_water[0]} bytes, "
+        f"delta={high_water[0] - baseline} bytes"
+    )
+    assert high_water[0] - baseline < 128 * 1024 * 1024
