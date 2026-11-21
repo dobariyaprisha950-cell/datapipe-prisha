@@ -531,7 +531,7 @@ async def test_discovered_entrypoint_plugin_executes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class ExampleEntryPoint:
-        name = "sample"
+        name = "isolated-test-entrypoint"
 
         @staticmethod
         def load() -> type[SampleIntegrationSource]:
@@ -540,14 +540,14 @@ async def test_discovered_entrypoint_plugin_executes(
     monkeypatch.setattr(
         "datapipe.plugins.discovery.entry_points", lambda **kwargs: [ExampleEntryPoint()]
     )
-    assert "sample" in discover()
+    assert "isolated-test-entrypoint" in discover()
     config = PipelineConfig.model_validate(
         {
             "name": "installed-plugin",
             "sources": [
                 {
                     "name": "external",
-                    "type": "sample",
+                    "type": "isolated-test-entrypoint",
                     "settings": {
                         "records": [{"id": "plugin-1", "date": "2026-01-01"}]
                     },
