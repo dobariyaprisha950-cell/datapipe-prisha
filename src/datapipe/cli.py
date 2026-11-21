@@ -13,6 +13,7 @@ from datapipe import __version__
 from datapipe.config.loader import load_config
 from datapipe.core.engine import run_pipeline
 from datapipe.core.exceptions import ConfigurationError
+from datapipe.observability.logging import ContextFilter, JsonLogFormatter
 from datapipe.observability.redaction import RedactionFilter
 from datapipe.plugins.discovery import discover
 
@@ -30,9 +31,8 @@ class _SignalTermination(Exception):
 def _logging(level: str) -> None:
     handler = logging.StreamHandler()
     handler.addFilter(RedactionFilter())
-    handler.setFormatter(
-        logging.Formatter('{"time":"%(asctime)s","level":"%(levelname)s","message":"%(message)s"}')
-    )
+    handler.addFilter(ContextFilter())
+    handler.setFormatter(JsonLogFormatter())
     logger = logging.getLogger("datapipe")
     logger.handlers.clear()
     logger.addHandler(handler)

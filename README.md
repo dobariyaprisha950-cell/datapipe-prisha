@@ -33,7 +33,9 @@ Install a package with a `datapipe.sources` entry point, e.g. `[project.entry-po
 
 ## Operation and security
 
-Records cross a Pydantic validation boundary; invalid data and malformed JSONL/non-object HTTP rows are written to `dead-letter.jsonl`. Outputs are written through same-filesystem staging and atomic replacement. Partition labels reject path characters. HTTP uses one shared client and bounded connection pool.
+Records cross a Pydantic validation boundary; invalid values, malformed CSV rows, malformed JSONL lines, malformed HTTP JSON, and non-object HTTP items are written to the central `dead-letter.jsonl` with source, input, timestamp, and error details. Outputs are written through same-filesystem staging and atomic replacement. Partition labels reject path characters. HTTP uses one shared client and bounded connection pool.
+
+Parquet preserves nested list/object values as JSON-encoded Arrow JSON columns; scalar columns retain their native Arrow types. Parquet outputs are partitioned by the configured date field and committed in batches.
 
 ### Checkpoints and output recovery
 
@@ -45,7 +47,7 @@ No-transform, mapping, filtering, fingerprinting, deduplication, and aggregation
 
 Stateful checkpoints written before transform-state journaling was added cannot be migrated reliably. DATAPIPE detects a committed legacy run with dedupe or aggregation and stops with an actionable error rather than silently resuming with incomplete state. Back up its output and start a new output directory for that migration.
 
-HTTP credentials are read from environment variables and logs pass through a redaction filter. OpenTelemetry stage spans and external secret-manager integration are not implemented.
+HTTP credentials are read from environment variables. Logs are valid JSON with run, source, and stage context, and the redaction filter removes credential values after message formatting. OpenTelemetry spans cover pipeline runs, source reads, record validation/transforms, and sink commits. The project depends on the OpenTelemetry API; configure an SDK and exporter in the host application to export spans. External secret-manager integration is not bundled.
 
 ## GitHub and TestPyPI release setup
 

@@ -38,6 +38,10 @@ The transaction lock is acquired before journal recovery, source processing, and
 
 The CLI installs SIGINT and SIGTERM handlers where Python permits, cancels the pipeline task, restores previous handlers, and exits with `128 + signal number`. The engine propagates cancellation through its TaskGroup and closes HTTP resources. Work submitted to `asyncio.to_thread` may finish while `asyncio.run` shuts down its executor; a batch is either journaled and recoverable or left as uncommitted staging data. POSIX subprocess tests send real SIGINT and SIGTERM. They are skipped on Windows; no Linux distribution is installed in the current validation host, so real POSIX signals remain unverified locally. On Windows, Ctrl+C can be delivered to an attached console process; `TerminateProcess`-style SIGTERM cannot be caught and relies on next-run recovery.
 
+## Observability
+
+The CLI emits one JSON object per log event with UTC timestamp, level, logger, run ID, source, stage, and message fields. Context variables carry run/source/stage fields across asyncio tasks and `asyncio.to_thread`. The redaction filter formats arguments before applying credential patterns, and the JSON formatter applies a final redaction pass. OpenTelemetry API spans instrument pipeline runs, source reads, record validation/transforms, and output commits. DATAPIPE does not ship a telemetry SDK or exporter; applications can register their own provider/exporter.
+
 ## Plugins
 
 Third-party source classes are discovered through the `datapipe.sources` entry-point group and registered in `SourceRegistry`. Configure the entry-point name as `type` and constructor arguments under `settings`. A resumable plugin accepts a `cursor` constructor keyword, exposes a cursor watermark that advances to the next item only as each item is yielded, and resumes from that watermark. Plugins without that constructor argument can run, but cannot be resumed by DATAPIPE. Static end-of-source cursors are unsafe for small batch sizes.

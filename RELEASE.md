@@ -1,6 +1,6 @@
 # GitHub and TestPyPI release setup
 
-This repository is prepared to publish the `datapipe-prisha` distribution to **TestPyPI only**. The GitHub Actions publisher uses OpenID Connect (OIDC); it does not use a stored PyPI password or API token. The release workflow runs the checks, builds the wheel and source distribution, validates their metadata, installs the wheel in a clean environment, then passes the built distributions to a separate least-privileged publishing job.
+This repository is prepared to publish the `datapipe-prisha` distribution to **TestPyPI only**. The GitHub Actions publisher uses OpenID Connect (OIDC); it does not use a stored PyPI password or API token. The release workflow verifies the GitHub Release tag matches the project version, runs the checks, enforces the core branch-coverage threshold, builds the wheel and source distribution, validates their metadata, installs the wheel in a clean environment, then passes the built distributions to a separate least-privileged publishing job.
 
 ## 1. Create or select the GitHub repository
 

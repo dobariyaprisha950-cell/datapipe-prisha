@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,24 @@ from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
 from datapipe.sinks.jsonl import JSONLSink
 from datapipe.sources.jsonl import JSONLSource
+
+
+async def with_http_server(
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    check: Callable[[str], Awaitable[None]],
+) -> None:
+    app = web.Application()
+    app.router.add_get("/data", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        await check(f"http://127.0.0.1:{port}/data")
+    finally:
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio
@@ -80,6 +98,211 @@ async def test_jsonl_malformed_is_emitted_as_rejection(tmp_path: Path) -> None:
     assert rows[0]["id"] == "ok"
     assert rows[1]["__datapipe_error__"]["input"] == "{bad json}"
     assert source.cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_csv_parse_and_shape_errors_are_dead_lettered_without_losing_good_rows(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "mixed.csv"
+    source_path.write_text(
+        "id,date,amount\n"
+        "ok,2026-01-01,5\n"
+        "short,2026-01-01\n"
+        'broken,2026-01-02,"unterminated\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "csv-dead-letter",
+            "sources": [{"name": "csv", "type": "csv", "path": str(source_path)}],
+            "sink": {"type": "jsonl", "output_dir": str(output)},
+        }
+    )
+    report = await run_pipeline(config)
+    dead = [
+        json.loads(line)
+        for line in (output / "dead-letter.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert report["total_fetched"] == 3
+    assert report["invalid_records"] == 2
+    assert report["records_written"] == 1
+    assert [item["source"] for item in dead] == ["csv", "csv"]
+    assert "broken,2026-01-02" in dead[1]["record"]
+
+
+@pytest.mark.asyncio
+async def test_user_record_with_reserved_marker_key_does_not_crash_pipeline(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "reserved-key.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {"id": "kept", "date": "2026-01-01", "__datapipe_error__": "user-value"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "reserved-key",
+            "sources": [{"name": "jsonl", "type": "jsonl", "path": str(source_path)}],
+            "sink": {"type": "jsonl", "output_dir": str(output)},
+        }
+    )
+    report = await run_pipeline(config)
+    assert report["records_written"] == 1
+    written = json.loads(next(output.glob("date=*/part-*.jsonl")).read_text(encoding="utf-8"))
+    assert written["__datapipe_error__"] == "user-value"
+
+
+@pytest.mark.asyncio
+async def test_http_malformed_json_and_invalid_items_reach_central_dead_letter(
+    tmp_path: Path,
+) -> None:
+    async def handler(request: web.Request) -> web.Response:
+        page = int(request.query["page"])
+        if page == 1:
+            return web.json_response([{"id": "ok", "date": "2026-01-01"}, "bad item"])
+        if page == 2:
+            return web.Response(text="not json", content_type="application/json")
+        return web.json_response([])
+
+    async def check(url: str) -> None:
+        output = tmp_path / "out"
+        config = PipelineConfig.model_validate(
+            {
+                "name": "http-dead-letter",
+                "sources": [
+                    {"name": "api", "type": "http", "url": url, "page_param": "page"}
+                ],
+                "sink": {"type": "jsonl", "output_dir": str(output)},
+            }
+        )
+        report = await run_pipeline(config)
+        dead = [
+            json.loads(line)
+            for line in (output / "dead-letter.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert report["records_written"] == 1
+        assert report["invalid_records"] == 2
+        assert {item["record"] for item in dead} == {"bad item", "not json"}
+        assert all(item["source"] == "api" for item in dead)
+
+    await with_http_server(handler, check)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_commits_partitioned_parquet_output(tmp_path: Path) -> None:
+    from pyarrow import parquet
+
+    source = tmp_path / "parquet.jsonl"
+    source.write_text(
+        '{"id":"one","date":"2026-01-01","value":1}\n'
+        '{"id":"two","date":"2026-01-02","value":2}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "parquet-integration",
+            "sources": [{"name": "input", "type": "jsonl", "path": str(source)}],
+            "sink": {
+                "type": "parquet",
+                "output_dir": str(output),
+                "batch_size": 1,
+            },
+        }
+    )
+    report = await run_pipeline(config)
+    files = sorted(output.glob("date=*/part-*.parquet"))
+    assert report["records_written"] == 2
+    assert [parquet.ParquetFile(path).read().to_pylist()[0]["id"] for path in files] == [
+        "one",
+        "two",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_sources_share_client_and_obey_per_host_connection_limit(
+    tmp_path: Path,
+) -> None:
+    active = 0
+    high_water = 0
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        nonlocal active, high_water
+        active += 1
+        high_water = max(high_water, active)
+        try:
+            await asyncio.sleep(0.02)
+            page = int(request.query["page"])
+            name = request.query.get("source", "record")
+            return web.json_response(
+                [{"id": name, "date": "2026-01-01"}] if page == 1 else []
+            )
+        finally:
+            active -= 1
+
+    async def check(url: str) -> None:
+        output = tmp_path / "out"
+        sources = [
+            {
+                "name": f"api-{index}",
+                "type": "http",
+                "url": url,
+                "page_param": "page",
+            }
+            for index in range(3)
+        ]
+        config = PipelineConfig.model_validate(
+            {
+                "name": "shared-http-client",
+                "sources": sources,
+                "concurrency": 2,
+                "sink": {"type": "jsonl", "output_dir": str(output)},
+            }
+        )
+        report = await run_pipeline(config)
+        assert report["records_written"] == 3
+
+    await with_http_server(handler, check)
+    assert high_water <= 2
+
+
+@pytest.mark.asyncio
+async def test_bounded_queue_applies_backpressure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datapipe.core import engine
+
+    full_observations = 0
+    base_queue = asyncio.Queue
+
+    class ObservedQueue(base_queue):
+        async def put(self, item: Any) -> None:
+            nonlocal full_observations
+            if self.full():
+                full_observations += 1
+            await super().put(item)
+
+    monkeypatch.setattr(engine.asyncio, "Queue", ObservedQueue)
+    source = tmp_path / "quick.jsonl"
+    source.write_text(
+        "".join(json.dumps({"id": index, "date": "2026-01-01"}) + "\n" for index in range(12)),
+        encoding="utf-8",
+    )
+    config = PipelineConfig.model_validate(
+        {
+            "name": "backpressure",
+            "sources": [{"name": "input", "type": "jsonl", "path": str(source)}],
+            "queue_size": 1,
+            "sink": {"type": "jsonl", "output_dir": str(tmp_path / "out"), "batch_size": 1},
+        }
+    )
+    report = await run_pipeline(config)
+    assert report["records_written"] == 12
+    assert full_observations > 0
 
 
 class SampleIntegrationSource:

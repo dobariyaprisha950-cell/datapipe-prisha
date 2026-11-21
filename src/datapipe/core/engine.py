@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import aiohttp
+from opentelemetry.trace import Status, StatusCode
 from pydantic import ValidationError
 
 from datapipe.config.schema import PipelineConfig, SourceConfig
@@ -22,6 +23,8 @@ from datapipe.core.checkpoint import Checkpoint
 from datapipe.core.commit import OutputCommitter
 from datapipe.core.locking import OutputDirectoryLock, OutputLockTimeout
 from datapipe.models.records import Record
+from datapipe.observability.logging import log_context
+from datapipe.observability.tracing import tracer
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
 from datapipe.sinks.jsonl import JSONLSink
@@ -155,17 +158,17 @@ async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[An
             yield item
 
 
-async def _execute_pipeline(
+async def _execute_pipeline_with_run_id(
     config: PipelineConfig,
     fail_fast: bool,
     dry_run: bool,
     transform_state: DiskTransformProcessor | None,
     fingerprint_executors: Mapping[int, FingerprintExecutor],
+    run_id: str,
 ) -> dict[str, Any]:
     """Run all sources concurrently; checkpoints advance only after sinks commit."""
     started = datetime.now(UTC)
     clock = time.perf_counter()
-    run_id = str(uuid.uuid4())
     queue: asyncio.Queue[tuple[str, Any, Any] | None] = asyncio.Queue(config.queue_size)
     counts: Counter[str] = Counter()
     valid: list[dict[str, Any]] = []
@@ -227,16 +230,28 @@ async def _execute_pipeline(
         if not stream_batch and not stream_dead and not stream_batch_position and not state_updates:
             return
         if committer is not None:
-            written.extend(
-                await _blocking_to_completion(
-                    committer.commit_batch,
-                    stream_batch,
-                    stream_dead,
-                    stream_batch_position,
-                    sink,
-                    state_updates,
+            with (
+                log_context(stage="sink_commit"),
+                tracer.start_as_current_span(
+                    "datapipe.sink.commit",
+                    attributes={
+                        "datapipe.records.output": len(stream_batch),
+                        "datapipe.records.dead_letter": len(stream_dead),
+                        "datapipe.sources.checkpointed": len(stream_batch_position),
+                    },
+                ) as commit_span,
+            ):
+                written.extend(
+                    await _blocking_to_completion(
+                        committer.commit_batch,
+                        stream_batch,
+                        stream_dead,
+                        stream_batch_position,
+                        sink,
+                        state_updates,
+                    )
                 )
-            )
+                commit_span.set_attribute("datapipe.output.files", len(written))
             if transform_state is not None:
                 transform_state.clear_pending()
         stream_batch.clear()
@@ -248,31 +263,40 @@ async def _execute_pipeline(
     connector = aiohttp.TCPConnector(limit=config.concurrency, limit_per_host=config.concurrency)
 
     async def producer(name: str, source: Any) -> None:
-        cancelled = False
-        should_send_end = True
-        try:
-            async for raw in _read(source, session):
-                await queue.put((name, raw, getattr(source, "cursor", None)))
-            completed.add(name)
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        except Exception as exc:
-            errors.append({"source": name, "error": f"{type(exc).__name__}: {exc}"})
-            log.exception("source failed: %s", name)
-            if fail_fast:
-                should_send_end = False
+        with (
+            log_context(source=name, stage="source_read"),
+            tracer.start_as_current_span(
+                "datapipe.source.read",
+                attributes={"datapipe.source": name, "datapipe.source_type": source_configs[name].type},
+            ) as source_span,
+        ):
+            cancelled = False
+            should_send_end = True
+            try:
+                async for raw in _read(source, session):
+                    await queue.put((name, raw, getattr(source, "cursor", None)))
+                completed.add(name)
+            except asyncio.CancelledError:
+                cancelled = True
                 raise
-        finally:
-            if cancelled:
-                try:
-                    queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-            elif should_send_end:
-                await queue.put(None)
+            except Exception as exc:
+                source_span.record_exception(exc)
+                source_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                errors.append({"source": name, "error": f"{type(exc).__name__}: {exc}"})
+                log.exception("source failed: %s", name)
+                if fail_fast:
+                    should_send_end = False
+                    raise
+            finally:
+                if cancelled:
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+                elif should_send_end:
+                    await queue.put(None)
 
-    async def consumer() -> None:
+    async def _consume_records() -> None:
         nonlocal valid_count, dead_count, streamed_record_count, stream_batch_raw_count
         finished = 0
         while finished < len(instances):
@@ -287,7 +311,12 @@ async def _execute_pipeline(
                     stream_batch_raw_count += 1
                     if source_cursor is not None:
                         stream_batch_position[name] = source_cursor
-                reason = raw.get("__datapipe_error__") if isinstance(raw, dict) else None
+                marker = (
+                    raw.get("__datapipe_error__")
+                    if isinstance(raw, dict) and set(raw) == {"__datapipe_error__"}
+                    else None
+                )
+                reason = marker if isinstance(marker, Mapping) else None
                 if reason is not None:
                     rejected = (
                         {
@@ -342,6 +371,16 @@ async def _execute_pipeline(
                     await flush_stream_batch()
             finally:
                 queue.task_done()
+
+    async def consumer() -> None:
+        with (
+            log_context(stage="record_validation_transform"),
+            tracer.start_as_current_span("datapipe.record_validation_transform") as span,
+        ):
+            await _consume_records()
+            span.set_attribute("datapipe.records.fetched", sum(counts.values()))
+            span.set_attribute("datapipe.records.valid", valid_count)
+            span.set_attribute("datapipe.records.invalid", dead_count)
 
     async with (
         aiohttp.ClientSession(timeout=session_timeout, connector=connector) as session,
@@ -458,6 +497,31 @@ async def _execute_pipeline(
     if committer is not None:
         committer.complete_run(run_id)
     return report
+
+
+async def _execute_pipeline(
+    config: PipelineConfig,
+    fail_fast: bool,
+    dry_run: bool,
+    transform_state: DiskTransformProcessor | None,
+    fingerprint_executors: Mapping[int, FingerprintExecutor],
+) -> dict[str, Any]:
+    run_id = str(uuid.uuid4())
+    with (
+        log_context(run_id=run_id, stage="pipeline"),
+        tracer.start_as_current_span(
+            "datapipe.pipeline",
+            attributes={"datapipe.pipeline": config.name, "datapipe.run_id": run_id},
+        ) as pipeline_span,
+    ):
+        report = await _execute_pipeline_with_run_id(
+            config, fail_fast, dry_run, transform_state, fingerprint_executors, run_id
+        )
+        for metric in ("total_fetched", "valid_records", "invalid_records", "records_written"):
+            value = report.get(metric)
+            if isinstance(value, int):
+                pipeline_span.set_attribute(f"datapipe.{metric}", value)
+        return report
 
 
 async def _run_pipeline_unlocked(

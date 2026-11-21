@@ -1,11 +1,13 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 import pytest
 from aiohttp import web
 
 from datapipe.core.exceptions import SourceError
-from datapipe.sources.http import HTTPSource
+from datapipe.sources.http import HTTPSource, _retry_after_seconds
 
 
 async def with_server(
@@ -61,6 +63,34 @@ async def test_429_retry_after_is_honored() -> None:
     async def check(url: str) -> None:
         source = HTTPSource("api", url, retries=1)
         assert len([row async for row in source.read()]) == 1
+
+    await with_server(handler, check)
+    assert attempts == 2
+
+
+def test_retry_after_accepts_http_date() -> None:
+    target = datetime.now(UTC) + timedelta(seconds=8)
+    delay = _retry_after_seconds(format_datetime(target, usegmt=True), 0)
+    assert 0 < delay <= 8
+
+
+@pytest.mark.asyncio
+async def test_429_http_date_retries_after_server_requested_delay() -> None:
+    attempts = 0
+
+    async def handler(_request: web.Request) -> web.StreamResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            target = datetime.now(UTC) + timedelta(seconds=1)
+            return web.Response(
+                status=429, headers={"Retry-After": format_datetime(target, usegmt=True)}
+            )
+        return web.json_response([{"id": "ok", "date": "2026-01-01"}])
+
+    async def check(url: str) -> None:
+        result = [row async for row in HTTPSource("api", url, retries=1).read()]
+        assert result[0]["id"] == "ok"
 
     await with_server(handler, check)
     assert attempts == 2

@@ -13,6 +13,36 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
+def _arrow_table(rows: Sequence[Mapping[str, Any]]) -> pa.Table:
+    """Build a table while encoding dynamic nested values as Arrow JSON columns.
+
+    Parquet cannot encode an empty struct. JSON extension columns preserve empty
+    objects and heterogeneous nested values without inventing struct fields.
+    """
+    values = [dict(row) for row in rows]
+    columns = {name for row in values for name, value in row.items() if isinstance(value, (Mapping, list))}
+    json_values: dict[str, list[str | None]] = {}
+    for name in columns:
+        encoded = [
+            None
+            if row.get(name) is None
+            else json.dumps(row[name], default=str, sort_keys=True, separators=(",", ":"))
+            for row in values
+        ]
+        json_values[name] = encoded
+        for row, item in zip(values, encoded, strict=True):
+            row[name] = item
+    table = pa.Table.from_pylist(values)
+    for name, encoded in json_values.items():
+        position = table.schema.get_field_index(name)
+        table = table.set_column(
+            position,
+            pa.field(name, pa.json_()),
+            pa.array(encoded, type=pa.json_()),
+        )
+    return table
+
+
 class ParquetSink:
     def __init__(self, root: str, partition_by: str = "date") -> None:
         self.root = Path(root).resolve()
@@ -42,7 +72,9 @@ class ParquetSink:
             fd, name = tempfile.mkstemp(dir=folder, prefix=".datapipe-")
             os.close(fd)
             try:
-                pq.write_table(pa.Table.from_pylist([dict(r) for r in rows]), name)
+                table = _arrow_table(rows)
+                with pa.OSFile(name, "wb") as parquet_file:
+                    pq.write_table(table, parquet_file)
                 with open(name, "rb+") as parquet_file:
                     parquet_file.flush()
                     os.fsync(parquet_file.fileno())

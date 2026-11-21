@@ -21,12 +21,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify release tag matches the package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected = {version, f"v{version}"}
+          actual = os.environ["RELEASE_TAG"]
+          assert actual in expected, f"release tag {actual!r} does not match {version!r}"
+          print(f"release tag {actual} matches package version {version}")
+          PY
       - run: uv lock --check
       - run: uv sync --locked --group dev
       - run: uv pip install --editable examples/plugin
       - run: uv run ruff check .
       - run: uv run mypy src/
-      - run: uv run pytest --ignore=tests/test_signal_shutdown.py --cov=datapipe.core --cov-branch --cov-report=term-missing --cov-fail-under=85
+      - run: mkdir -p work
+      - run: uv run pytest --ignore=tests/test_signal_shutdown.py --cov=datapipe.core --cov-branch --cov-report=term-missing --cov-report=json:work/core-coverage.json --cov-fail-under=85
+      - name: Enforce core branch coverage threshold
+        run: uv run python scripts/check_branch_coverage.py work/core-coverage.json --minimum 85
       - name: Run real POSIX signal and resume tests
         run: uv run pytest tests/test_signal_shutdown.py -vv
       - run: uv run pip-audit

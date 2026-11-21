@@ -1,14 +1,34 @@
 """HTTP JSON source with bounded retries and pagination."""
 
 import asyncio
+import json
 import os
 import random
 from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import aiohttp
 
 from datapipe.core.exceptions import SourceError
+
+
+def _retry_after_seconds(value: str | None, attempt: int) -> float:
+    """Parse both delta-seconds and HTTP-date Retry-After values."""
+    fallback: float = min(30.0, 2**attempt + random.random())
+    if value is None:
+        return fallback
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return fallback
 
 
 class HTTPSource:
@@ -63,15 +83,22 @@ class HTTPSource:
                             if response.status == 429 or response.status >= 500:
                                 if attempt >= self.retries:
                                     response.raise_for_status()
-                                delay = float(
-                                    response.headers.get(
-                                        "Retry-After", min(30, 2**attempt + random.random())
-                                    )
+                                delay = _retry_after_seconds(
+                                    response.headers.get("Retry-After"), attempt
                                 )
                                 await asyncio.sleep(max(0, min(delay, 60)))
                                 continue
                             response.raise_for_status()
-                            payload = await response.json()
+                            body = (await response.read()).decode("utf-8", errors="replace")
+                            try:
+                                payload = json.loads(body)
+                            except json.JSONDecodeError as exc:
+                                payload = {
+                                    "__datapipe_error__": {
+                                        "input": body,
+                                        "reason": f"malformed HTTP JSON: {exc}",
+                                    }
+                                }
                         break
                     except aiohttp.ClientResponseError as exc:
                         if 400 <= exc.status < 500 and exc.status != 429:
@@ -85,7 +112,9 @@ class HTTPSource:
                         if attempt >= self.retries:
                             raise
                         await asyncio.sleep(min(30, 2**attempt + random.random()))
-                if isinstance(payload, list):
+                if isinstance(payload, dict) and set(payload) == {"__datapipe_error__"}:
+                    items = [payload]
+                elif isinstance(payload, list):
                     items = payload
                 elif isinstance(payload, dict):
                     items = payload.get(self.items_key, []) if self.items_key else [payload]
