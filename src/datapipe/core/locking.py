@@ -39,7 +39,7 @@ class OutputDirectoryLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         stream = self.path.open("a+b")
         if os.name == "nt":
-            import msvcrt
+            msvcrt = cast(Any, import_module("msvcrt"))
 
             stream.seek(0, os.SEEK_END)
             if stream.tell() == 0:
@@ -47,7 +47,7 @@ class OutputDirectoryLock:
                 stream.flush()
         try:
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, import_module("msvcrt"))
 
                 stream.seek(0)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
@@ -66,7 +66,7 @@ class OutputDirectoryLock:
             return
         try:
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, import_module("msvcrt"))
 
                 stream.seek(0)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
