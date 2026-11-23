@@ -23,6 +23,29 @@ Then, from this repository, run `uv lock` followed by `uv sync --locked --group 
 
 From the repository root run `uv run datapipe validate-config pipeline.toml`, then `uv run datapipe run pipeline.toml`. The included example reads CSV and JSONL, maps and deduplicates, then writes date partitions, dead letters and a summary under `examples/output/`. Use `--dry-run`, `--json`, or `--fail-fast`. `--version`, `validate-config`, and `list-plugins` are available.
 
+### Verify the published TestPyPI release in a fresh environment
+
+The `0.1.0` TestPyPI release was smoke-tested from a new virtual environment on Windows with Python 3.14.7. To ensure the application wheel comes from TestPyPI while dependencies come from the trusted production index, install runtime dependencies from PyPI first and then install the release wheel without dependency resolution:
+
+```powershell
+py -3.12 -m venv .venv-testpypi
+$python = ".\.venv-testpypi\Scripts\python.exe"
+$cli = ".\.venv-testpypi\Scripts\datapipe.exe"
+& $python -m pip install --upgrade pip
+& $python -m pip install --index-url https://pypi.org/simple/ 'aiohttp>=3.11,<4' 'opentelemetry-api>=1.29,<2' 'pyarrow>=18,<24' 'pydantic>=2.10,<3' 'PyYAML>=6,<7' 'typer>=0.15,<1'
+& $python -m pip install --no-deps --index-url https://test.pypi.org/simple/ datapipe-prisha==0.1.0
+& $python -c "import datapipe, importlib.metadata as m; print(m.version('datapipe-prisha')); print(datapipe.__file__)"
+& $cli --version
+& $cli --help
+& $cli validate-config examples/demo-pipeline.yaml
+& $cli list-plugins
+& $cli run examples/demo-pipeline.yaml --json
+```
+
+The pip output should show `datapipe_prisha-0.1.0` downloaded from `test-files.pythonhosted.org`; the import path should point into `.venv-testpypi\Lib\site-packages\datapipe`, not `src`. The included sample uses repository sample data and writes under `work/demo-output`. For an isolated run, copy `examples/demo-pipeline.yaml` and `examples/data/` to a temporary directory, change the configured output and checkpoint paths to that directory, then run the copied config while using the same installed CLI. The checked sample run fetched 7 records from two sources, accepted 4, dead-lettered 3, removed 1 duplicate, and wrote 3 partitioned records plus `summary.json`.
+
+To verify the separately installable example plugin after installing the DATAPIPE release, install `examples/plugin` into that same environment (`& $python -m pip install .\examples\plugin`), then run `& $cli list-plugins`. The plugin is a separate distribution and is not bundled into `datapipe-prisha`.
+
 ## Configuration
 
 See `pipeline.toml` and `pipeline.yaml`. Sources have `name` and `type` (`http`, `csv`, or `jsonl`), plus source-specific options. HTTP auth references an environment variable via `auth_env`; token values are never part of config. Transforms include `mapping` (`settings.fields`), `filtering` (`field`, `op`, `value`), `deduplication` (`key`), `aggregation` (`date_field`, `metrics`), and `cpu_fingerprint` (`field`, `rounds`, optional `execution`, `workers`, and `expected_records`). Sinks are JSONL or Parquet and partition by `date` by default. YAML uses safe loading.

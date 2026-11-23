@@ -30,11 +30,27 @@ Both regression checks ran against the actual pipeline engine with bounded sink 
 
 | Workload | Result | Elapsed | Peak RSS growth | State/output disk |
 |---|---|---:|---:|---:|
-| 2,000,000 unique-key deduplication | Passed | 252.77 s | 30,597,120 bytes | SQLite state 116,942,845 bytes; output 207,832,305 bytes |
-| 5,000,000 unique-key deduplication | Passed | 545.67 s | 29,528,064 bytes | SQLite state 294,023,095 bytes; output 522,912,554 bytes |
+| 2,000,000 unique-key deduplication | Passed | 202.25 s | 36,372,480 bytes | SQLite state 116,942,845 bytes; output 207,832,305 bytes |
+| 5,000,000 unique-key deduplication | Passed | 587.68 s | 36,438,016 bytes | SQLite state 294,023,095 bytes; output 522,912,554 bytes |
 | 2,000,000 rows, one aggregation group | Passed | 328.58 s | 2,191,360 bytes | The test reported bounded RSS; disk size was not separately captured |
 
 The dedupe runs used a 20,000-record sink batch. The five-million measurement used `DATAPIPE_DEDUPE_RECORDS=5000000`; the test duration includes generated input creation, pipeline execution, memory sampling, disk measurement, and output checks. The aggregation case used one group, so its in-memory group cardinality remained one while input count increased. A separate 30,000-group aggregation case passed and checks many on-disk groups. These are observations on this Windows/Python host, not universal memory guarantees. Working memory grows with configured queue/batch sizes and aggregate group cardinality; SQLite disk use grows with distinct keys, groups, and committed journal deltas.
+
+Paired remeasurement on 2026-11-23 used the same test and instrumentation for 2 million and 5 million unique-key records. In PowerShell, reproduce the two-million run with:
+
+```powershell
+$env:DATAPIPE_DEDUPE_RECORDS='2000000'
+.venv\Scripts\python.exe -m pytest tests\test_disk_transforms.py::test_streaming_high_cardinality_dedup_does_not_keep_source_rows -s -q --basetemp work\pytest-2m-final
+```
+
+For five million records, use:
+
+```powershell
+$env:DATAPIPE_DEDUPE_RECORDS='5000000'
+.venv\Scripts\python.exe -m pytest tests\test_disk_transforms.py::test_streaming_high_cardinality_dedup_does_not_keep_source_rows -s -q --basetemp work\pytest-5m-final
+```
+
+The test generates JSONL incrementally, then measures RSS growth around the pipeline run (so source generation and the source file itself are outside the RSS-growth interval); it checks all records were written and the test's 96 MiB growth limit was met. RSS growth was 36,372,480 bytes at 2 million and 36,438,016 bytes at 5 million, while SQLite state plus output disk grew from about 310 MiB to 779 MiB. This shows bounded process memory for this deduplication workload as the input grows 2.5x; it does not imply bounded disk usage, nor does it guarantee the same RSS on other hosts. Both measurements were on Python 3.14.7 / Windows 10 build 19045. The sampler is periodic and can miss very brief RSS peaks.
 
 ## Reproduce
 
@@ -85,6 +101,10 @@ Reproduce the current isolated benchmark with `uv run python benchmarks/benchmar
 | 50,000 | 50,000 (default) | 15 | 0.462349 s | 0.135278 s | 3.42x | 49,340,416 / 32,169,984 bytes | 65,220,608 / 43,261,952 bytes | Equal |
 | 50,000 | 5,000 | 11 | 0.509039 s | 0.228154 s | 2.23x | 49,225,728 / 32,055,296 bytes | 63,504,384 / 43,098,112 bytes | Equal |
 | 200,000 | 5,000 | 3 | 1.879496 s | 0.760609 s | 2.47x | 91,148,288 / 73,977,856 bytes | 104,296,448 / 83,918,848 bytes | Equal |
+
+Fresh remeasurement on 2026-11-23 with the same deterministic 50,000-row workload, one 50,000-row Arrow batch, and 15 interleaved runs produced 0.417812 s exact-Python median versus 0.135114 s PyArrow median: **3.09x**. The outputs were normalized and compared exactly. Throughput was 119,671 records/s versus 370,058 records/s. Fresh subprocess peak RSS/USS was 49,418,240 / 32,243,712 bytes for Python and 64,049,152 / 43,679,744 bytes for Arrow. Environment: Python 3.14.7, PyArrow 23.0.1, Windows 10 build 19045, Intel64 Family 6 Model 69 Stepping 1, four logical CPUs. Reproduce with `uv run python benchmarks/benchmark_aggregation.py --records 50000 --batch-size 50000 --runs 15`. This narrowly exceeds 3x only for this in-memory workload and this batch/host configuration; the 5,000-row-batch and end-to-end measurements below remain under 3x.
+
+For bottleneck evidence, cProfile was run separately on the same 50,000-row workload, with PyArrow warmed before profiling. In the exact Python profile, `_aggregate_grouped_python` took 2.865 s cumulative under instrumentation; `Fraction.from_float` ran 50,000 times and Fraction addition ran 50,000 times. In the warmed Arrow profile, `_aggregate_grouped_arrow` took 0.170 s cumulative; its two `flush_batch` calls accounted for 0.166 s, Arrow compute wrappers for 0.091 s, and the group-by kernel for 0.011 s. Profiling adds instrumentation overhead and these numbers are diagnostic only; benchmark medians above are unprofiled.
 
 The fresh 50,000-row/default-batch run achieved 3.42x (15 interleaved runs), while fresh-process measurements with 5,000-row Arrow batches were 2.23x for 50,000 rows and 2.47x for 200,000 rows. Thus the in-memory 3x objective is demonstrated for the 50,000-row dataset only when the whole dataset fits in one bounded Arrow table; it is not met with a 5,000-row batch or by the disk-backed end-to-end pipeline. Peak USS grew by about 39.8 MiB for Python and 38.9 MiB for Arrow when input grew from 50,000 to 200,000 rows; this is expected because the public in-memory API receives and retains the complete caller-owned list. For 50,000 rows with the 5,000-row Arrow batch, Arrow used about 10.5 MiB more USS than exact Python, including imports, input construction, and native buffers. The batch limits Arrow table materialization, not the API's input or output lists. RSS/USS are independently sampled and can miss a very brief peak; RSS sums process-tree resident pages while USS estimates unique pages. Reproduce with `uv run python benchmarks/benchmark_aggregation.py --records 50000 --batch-size 50000 --runs 15` and scale `--records` or vary `--batch-size` to inspect growth. Results depend on Python/PyArrow builds, CPU, and background load.
 
