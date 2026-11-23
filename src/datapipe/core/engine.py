@@ -114,38 +114,94 @@ def _transform_record(
     config: PipelineConfig,
     fingerprint_executors: Mapping[int, FingerprintExecutor] | None = None,
 ) -> dict[str, Any] | None:
-    """Apply the order-preserving, record-local transformation subset."""
-    result = row
+    """Apply the batch transform implementation to one row for compatibility."""
+    result, error = _transform_records([row], config, fingerprint_executors or {})[0]
+    if error is not None:
+        raise error
+    return result
+
+
+def _transform_records(
+    rows: list[dict[str, Any]],
+    config: PipelineConfig,
+    fingerprint_executors: Mapping[int, FingerprintExecutor],
+) -> list[tuple[dict[str, Any] | None, Exception | None]]:
+    """Transform a bounded batch while batching CPU fingerprints by stage."""
+    results: list[dict[str, Any] | None] = [dict(row) for row in rows]
+    errors: list[Exception | None] = [None for _ in rows]
     for stage, transform in enumerate(config.transforms):
         settings = transform.settings
         if transform.type == "mapping":
-            result = map_record(result, settings.get("fields", {}))
+            for index, row in enumerate(results):
+                if row is None or errors[index] is not None:
+                    continue
+                try:
+                    results[index] = map_record(row, settings.get("fields", {}))
+                except (ValidationError, TypeError, ValueError) as exc:
+                    results[index], errors[index] = None, exc
         elif transform.type == "filtering":
-            selected = next(
-                iter(
-                    filter_records(
-                        [result],
-                        str(settings["field"]),
-                        str(settings["op"]),
-                        settings.get("value"),
+            for index, row in enumerate(results):
+                if row is None or errors[index] is not None:
+                    continue
+                try:
+                    selected = next(
+                        iter(
+                            filter_records(
+                                [row],
+                                str(settings["field"]),
+                                str(settings["op"]),
+                                settings.get("value"),
+                            )
+                        ),
+                        None,
                     )
-                ),
-                None,
-            )
-            if selected is None:
-                return None
-            result = dict(selected)
+                    results[index] = dict(selected) if selected is not None else None
+                except (ValidationError, TypeError, ValueError) as exc:
+                    results[index], errors[index] = None, exc
         elif transform.type == "cpu_fingerprint":
-            value = result.get(str(settings["field"]))
-            if isinstance(value, (int, float)):
-                rounds = int(settings.get("rounds", 1000))
-                executor = (fingerprint_executors or {}).get(stage)
-                result[str(settings.get("output_field", "fingerprint"))] = (
-                    executor.apply(int(value), rounds)
-                    if executor is not None
-                    else _fingerprint_fast(int(value), rounds)
-                )
-    return result
+            field = str(settings["field"])
+            output_field = str(settings.get("output_field", "fingerprint"))
+            rounds = int(settings.get("rounds", 1000))
+            indices: list[int] = []
+            values: list[int] = []
+            for index, row in enumerate(results):
+                if row is None or errors[index] is not None:
+                    continue
+                value = row.get(field)
+                if isinstance(value, (int, float)):
+                    try:
+                        values.append(int(value))
+                        indices.append(index)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        results[index], errors[index] = None, exc
+            executor = fingerprint_executors.get(stage)
+            fingerprints = (
+                executor.apply_many(values, rounds)
+                if executor is not None
+                else [_fingerprint_fast(value, rounds) for value in values]
+            )
+            for index, fingerprint in zip(indices, fingerprints, strict=True):
+                row = results[index]
+                if row is not None:
+                    row[output_field] = fingerprint
+    return list(zip(results, errors, strict=True))
+
+
+def _transform_state_batch(
+    processor: DiskTransformProcessor,
+    rows: list[dict[str, Any]],
+    start: int,
+    fingerprint_executors: Mapping[int, FingerprintExecutor],
+) -> list[dict[str, Any]]:
+    """Transform finalized stateful output and preserve fatal post-aggregation errors."""
+    outcomes = processor.process_many(rows, start, fingerprint_executors)
+    results: list[dict[str, Any]] = []
+    for transformed, error in outcomes:
+        if error is not None:
+            raise error
+        if transformed is not None:
+            results.append(transformed)
+    return results
 
 
 async def _read(source: Any, session: aiohttp.ClientSession) -> AsyncIterator[Any]:
@@ -214,12 +270,43 @@ async def _execute_pipeline_with_run_id(
     )
     written: list[Path] = []
     stream_batch: list[dict[str, Any]] = []
+    stream_transform_batch: list[tuple[str, Any, dict[str, Any]]] = []
     stream_dead: list[dict[str, Any]] = []
     stream_batch_position: dict[str, Any] = {}
     stream_batch_raw_count = 0
 
+    def transform_pending_records() -> None:
+        nonlocal dead_count, streamed_record_count
+        if not stream_transform_batch:
+            return
+        records = [record for _, _, record in stream_transform_batch]
+        transformed = (
+            transform_state.process_many(records, fingerprint_executors=fingerprint_executors)
+            if transform_state is not None
+            else _transform_records(records, config, fingerprint_executors)
+        )
+        for (name, raw, _), (result, error) in zip(
+            stream_transform_batch, transformed, strict=True
+        ):
+            if error is not None:
+                stream_dead.append(
+                    {
+                        "source": name,
+                        "record": raw,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "error": str(error),
+                        "details": str(error),
+                    }
+                )
+                dead_count += 1
+            elif result is not None:
+                stream_batch.append(result)
+                streamed_record_count += 1
+        stream_transform_batch.clear()
+
     async def flush_stream_batch() -> None:
         nonlocal stream_batch_raw_count
+        transform_pending_records()
         state_updates = transform_state.pending_updates() if transform_state is not None else []
         if (
             transform_state is not None
@@ -339,14 +426,7 @@ async def _execute_pipeline_with_run_id(
                         )
                         valid_count += 1
                         if streaming:
-                            transformed = (
-                                transform_state.process(record, fingerprint_executors=fingerprint_executors)
-                                if transform_state is not None
-                                else _transform_record(record, config, fingerprint_executors)
-                            )
-                            if transformed is not None:
-                                stream_batch.append(transformed)
-                                streamed_record_count += 1
+                            stream_transform_batch.append((name, raw, record))
                         else:
                             valid.append(record)
                     except (ValidationError, TypeError, ValueError) as exc:
@@ -396,6 +476,8 @@ async def _execute_pipeline_with_run_id(
             if cursor_value is not None:
                 stream_batch_position[name] = cursor_value
         await flush_stream_batch()
+    elif streaming:
+        transform_pending_records()
 
     if transform_state is not None and committer is not None:
         for stage, transform in enumerate(config.transforms):
@@ -405,19 +487,26 @@ async def _execute_pipeline_with_run_id(
             if done:
                 continue
             date_field = str(transform.settings.get("date_field", "date"))
+            aggregate_batch: list[dict[str, Any]] = []
             processed = 0
             for aggregate in transform_state.aggregate_rows(stage, date_field, last_day):
-                transformed = transform_state.process(
-                    aggregate, stage + 1, fingerprint_executors
-                )
-                if transformed is not None:
-                    stream_batch.append(transformed)
-                    streamed_record_count += 1
+                aggregate_batch.append(aggregate)
                 transform_state.set_progress(stage, str(aggregate[date_field]))
                 processed += 1
                 if processed >= config.sink.batch_size:
+                    transformed_rows = _transform_state_batch(
+                        transform_state, aggregate_batch, stage + 1, fingerprint_executors
+                    )
+                    stream_batch.extend(transformed_rows)
+                    streamed_record_count += len(transformed_rows)
+                    aggregate_batch.clear()
                     await flush_stream_batch()
                     processed = 0
+            transformed_rows = _transform_state_batch(
+                transform_state, aggregate_batch, stage + 1, fingerprint_executors
+            )
+            stream_batch.extend(transformed_rows)
+            streamed_record_count += len(transformed_rows)
             final_day, _ = transform_state.progress(stage)
             transform_state.set_progress(stage, final_day, True)
             await flush_stream_batch()

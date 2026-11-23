@@ -16,9 +16,18 @@ from typing import Any
 
 from datapipe.config.schema import TransformConfig
 from datapipe.core.exceptions import TransformStateError
+from datapipe.transforms.aggregation import (
+    _DEFAULT_BATCH_SIZE as _AGGREGATION_BATCH_SIZE,
+)
+from datapipe.transforms.aggregation import (
+    _aggregate_grouped_arrow,
+    _DailyArrowSummary,
+)
 from datapipe.transforms.filtering import filter_records
 from datapipe.transforms.mapping import map_record
 from datapipe.transforms.parallel import FingerprintExecutor, _fingerprint_fast
+
+_MIN_DISK_ARROW_RECORDS = 1_000
 
 
 class DiskTransformProcessor:
@@ -184,6 +193,117 @@ class DiskTransformProcessor:
                 return None
         return result
 
+    def process_many(
+        self,
+        rows: list[dict[str, Any]],
+        start: int = 0,
+        fingerprint_executors: Mapping[int, FingerprintExecutor] | None = None,
+    ) -> list[tuple[dict[str, Any] | None, Exception | None]]:
+        """Apply transforms to a bounded batch, preserving stateful row order."""
+        results: list[dict[str, Any] | None] = [dict(row) for row in rows]
+        errors: list[Exception | None] = [None for _ in rows]
+        for stage in range(start, len(self.transforms)):
+            transform = self.transforms[stage]
+            settings = transform.settings
+            if transform.type == "mapping":
+                for index, row in enumerate(results):
+                    if row is None or errors[index] is not None:
+                        continue
+                    try:
+                        results[index] = map_record(row, settings.get("fields", {}))
+                    except (TypeError, ValueError) as exc:
+                        results[index], errors[index] = None, exc
+            elif transform.type == "filtering":
+                for index, row in enumerate(results):
+                    if row is None or errors[index] is not None:
+                        continue
+                    try:
+                        selected = next(
+                            iter(
+                                filter_records(
+                                    [row],
+                                    str(settings["field"]),
+                                    str(settings["op"]),
+                                    settings.get("value"),
+                                )
+                            ),
+                            None,
+                        )
+                        results[index] = dict(selected) if selected is not None else None
+                    except (TypeError, ValueError) as exc:
+                        results[index], errors[index] = None, exc
+            elif transform.type == "cpu_fingerprint":
+                field = str(settings["field"])
+                output_field = str(settings.get("output_field", "fingerprint"))
+                rounds = int(settings.get("rounds", 1000))
+                indices: list[int] = []
+                values: list[int] = []
+                for index, row in enumerate(results):
+                    if row is None or errors[index] is not None:
+                        continue
+                    value = row.get(field)
+                    if isinstance(value, (int, float)):
+                        try:
+                            values.append(int(value))
+                            indices.append(index)
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            results[index], errors[index] = None, exc
+                executor = (fingerprint_executors or {}).get(stage)
+                fingerprints = (
+                    executor.apply_many(values, rounds)
+                    if executor is not None
+                    else [_fingerprint_fast(value, rounds) for value in values]
+                )
+                for index, fingerprint in zip(indices, fingerprints, strict=True):
+                    row = results[index]
+                    if row is not None:
+                        row[output_field] = fingerprint
+            elif transform.type == "deduplication":
+                key = str(settings["key"])
+                for index, row in enumerate(results):
+                    if row is None or errors[index] is not None:
+                        continue
+                    try:
+                        if not self.accept(stage, row, key):
+                            results[index] = None
+                    except (TypeError, ValueError) as exc:
+                        results[index], errors[index] = None, exc
+            elif transform.type == "aggregation":
+                date_field = str(settings.get("date_field", "date"))
+                metrics = settings.get("metrics", {})
+                aggregate_rows = [
+                    row
+                    for row, error in zip(results, errors, strict=True)
+                    if row is not None and error is None
+                ]
+                summaries = (
+                    _aggregate_grouped_arrow(
+                        aggregate_rows,
+                        date_field,
+                        metrics,
+                        _AGGREGATION_BATCH_SIZE,
+                    )
+                    if len(aggregate_rows) >= _MIN_DISK_ARROW_RECORDS
+                    else None
+                )
+                if summaries is not None:
+                    for summary in summaries:
+                        self.add_aggregate_summary(stage, summary, metrics)
+                    for index, row in enumerate(results):
+                        if row is not None and errors[index] is None:
+                            results[index] = None
+                    return list(zip(results, errors, strict=True))
+                for index, row in enumerate(results):
+                    if row is None or errors[index] is not None:
+                        continue
+                    try:
+                        self.add_to_aggregate(stage, row, date_field, metrics)
+                        results[index] = None
+                    except (TypeError, ValueError) as exc:
+                        results[index], errors[index] = None, exc
+                return list(zip(results, errors, strict=True))
+        return list(zip(results, errors, strict=True))
+
     @staticmethod
     def _key_token(value: Any) -> str:
         try:
@@ -303,6 +423,79 @@ class DiskTransformProcessor:
             self.connection.execute(
                 "INSERT OR IGNORE INTO dirty_aggregates(stage, day) VALUES (?, ?)",
                 (stage, day),
+            )
+            if stage not in self._progress_reopened:
+                self._progress_reopened.add(stage)
+                progress = self.connection.execute(
+                    "SELECT last_day, done FROM progress WHERE stage=?", (stage,)
+                ).fetchone()
+                if progress is None or progress[0] is not None or bool(progress[1]):
+                    self.set_progress(stage, None, False)
+        except sqlite3.Error as exc:
+            raise TransformStateError(f"disk-backed aggregation failed: {exc}") from exc
+
+    def add_aggregate_summary(
+        self, stage: int, summary: _DailyArrowSummary, metrics: Mapping[str, str]
+    ) -> None:
+        """Merge a proven-safe Arrow batch summary into journaled exact state.
+
+        Integer sum subtotals are converted to exact Fraction units only after
+        Arrow has proven their inputs and every partial sum are exactly
+        representable. This keeps subsequent batches equivalent to row-by-row
+        state accumulation, including after journal replay.
+        """
+        try:
+            current = self.connection.execute(
+                "SELECT state FROM aggregates WHERE stage=? AND day=?",
+                (stage, summary.day),
+            ).fetchone()
+            state: dict[str, Any] = (
+                json.loads(current[0]) if current else {"rows": 0, "metrics": {}}
+            )
+            state["rows"] = int(state["rows"]) + summary.row_count
+            metric_state: dict[str, Any] = state["metrics"]
+            for field, operation in metrics.items():
+                if operation == "count":
+                    continue
+                if operation == "sum":
+                    integer_total = summary.integer_sums.get(field, 0)
+                    accumulator = metric_state.get(field) or {
+                        "units": 0,
+                        "nan": False,
+                        "positive_inf": False,
+                        "negative_inf": False,
+                    }
+                    numerator, denominator = float(integer_total).as_integer_ratio()
+                    exponent = denominator.bit_length() - 1
+                    accumulator["units"] += numerator << (1074 - exponent)
+                    metric_state[field] = accumulator
+                elif operation in {"min", "max"}:
+                    value = summary.metrics.get(f"{field}_{operation}")
+                    if value is not None:
+                        previous = metric_state.get(field)
+                        if previous is None:
+                            metric_state[field] = value
+                        elif operation == "min":
+                            metric_state[field] = min(previous, value)
+                        else:
+                            metric_state[field] = max(previous, value)
+                else:
+                    raise ValueError(f"unsupported aggregate: {operation}")
+
+            encoded = json.dumps(state, allow_nan=True, separators=(",", ":"))
+            self.connection.execute(
+                "INSERT INTO aggregates(stage, day, state) VALUES (?, ?, ?) "
+                "ON CONFLICT(stage, day) DO UPDATE SET state=excluded.state",
+                (stage, summary.day, encoded),
+            )
+            self.connection.execute(
+                "INSERT INTO pending_aggregates(stage, day, state) VALUES (?, ?, ?) "
+                "ON CONFLICT(stage, day) DO UPDATE SET state=excluded.state",
+                (stage, summary.day, encoded),
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO dirty_aggregates(stage, day) VALUES (?, ?)",
+                (stage, summary.day),
             )
             if stage not in self._progress_reopened:
                 self._progress_reopened.add(stage)

@@ -39,3 +39,74 @@ The dedupe runs used a 20,000-record sink batch. The five-million measurement us
 ## Reproduce
 
 Run `uv run python benchmarks/benchmark.py --records 20000 --workers 4 --rounds 5000 --runs 3` and `uv run python benchmarks/profile_normalizer.py --records 5000 --rounds 5000`. The disk-backed two-million-row checks are `tests/test_disk_transforms.py::test_streaming_high_cardinality_dedup_does_not_keep_source_rows` and `tests/test_disk_transforms.py::test_streaming_large_aggregation_keeps_only_group_state_in_memory`; set `DATAPIPE_DEDUPE_RECORDS=2000000` or `5000000` for the deduplication measurements, and `DATAPIPE_AGGREGATION_RECORDS=2000000` for aggregation. Results depend on host, filesystem, queue, and batch configuration.
+
+## Fingerprint batching follow-up (2026-11-21)
+
+The pre-change profile showed that the streaming engine called `FingerprintExecutor.apply()` once per row. On the 5,000-row process-pipeline profile, this made 5,000 synchronous submissions/results; the caller waited on process-pool IPC for each one. The affine fingerprint itself is already exact and O(log rounds) to derive its coefficients, then O(1) per value. Consequently, process startup, serialization, and synchronization now cost more than the work being parallelized. Threads also run Python bytecode under the GIL.
+
+The pipeline now accumulates validated records up to its bounded sink batch, transforms a whole stage batch, and submits at most one contiguous integer chunk per worker to a reusable executor. The same batching is used around disk-backed deduplication/aggregation, including fingerprint stages after aggregation. Record ordering, first-seen dedupe semantics, per-record transform error routing, and checkpoint commit boundaries are retained. The standalone `fingerprint_records_parallel()` API still constructs a pool per call, so its process startup cost remains visible.
+
+### Isolated API before/after
+
+Measured on Windows 10 build 19045, Python 3.14.7, Intel64 Family 6 Model 69 Stepping 1, four logical CPUs. Both runs used 20,000 identical records, 5,000 rounds, four requested workers, three repetitions, exact normalized-output equality, and the same benchmark command. “Before” used the source at the then-current base commit; “after” used batched executor code.
+
+| Mode | Before median (s) | Before speed vs sequential | After median (s) | After speed vs sequential |
+|---|---:|---:|---:|---:|
+| Sequential | 0.032962 | 1.00x | 0.041458 | 1.00x |
+| Thread | 0.049553 | 0.67x | 0.088752 | 0.47x |
+| Process | 1.250154 | 0.026x | 1.091476 | 0.038x |
+
+Both outputs matched exactly. These noisy isolated timings show no material parallel improvement; the public standalone function already sent a small number of large chunks and includes process-pool startup on every call. The after-run process pool used about 143.9 MB peak RSS including children, versus 138.3 MB before. Sequential remains the default.
+
+### Complete pipeline current measurement
+
+Command: `uv run python benchmarks/benchmark_pipeline.py --records 5000 --workers 4 --rounds 5000 --batch-size 500 --runs 3`. This measures a generated JSONL source through validation, fingerprint transformation, output commits, and summary reporting. The three modes use the same input, each writes 5,000 records, and normalized outputs matched. Mode order is deterministically shuffled per repetition. Timed runs do not start an RSS sampler; memory is collected in separate subsequent pipeline runs. Host: Python 3.14.7, Windows 10 build 19045, Intel64 Family 6 Model 69 Stepping 1, four logical CPUs.
+
+| Mode | Run times (s) | Median (s) | Throughput | Peak RSS incl. children (separate memory pass) |
+|---|---:|---:|---:|---:|
+| Sequential | 0.829298, 0.615053, 0.605960 | 0.615053 | 8,129 records/s | 74,526,720 bytes |
+| Thread | 0.647316, 0.597999, 0.615463 | 0.615463 | 8,124 records/s | 74,653,696 bytes |
+| Process | 4.703394, 4.817708, 4.822483 | 4.817708 | 1,038 records/s | 320,729,088 bytes |
+
+Relative to sequential, thread mode measured 0.999x and process mode 0.128x. Process mode remains substantially slower and used over four times the sequential peak RSS in its separate memory pass. The memory sampler runs after timing; measurements are absolute process-tree RSS from the same parent process, so retained allocator memory can affect comparisons. These results replace the earlier pipeline table whose memory sampler ran concurrently with timing. Sequential remains the default.
+
+### After-change cProfile evidence
+
+Command: `uv run python benchmarks/profile_pipeline.py --records 5000 --workers 4 --rounds 5000 --batch-size 500 --execution process`. The parent profile observed 10 `_transform_records` batch calls and 50 worker-map result chunks, rather than 5,000 per-record submissions. It attributed about 4.0 seconds to batch transform calls/waiting and 5.3 seconds to process-pool shutdown under profiling. cProfile does not instrument child-process execution and adds overhead; use the unprofiled benchmark table for elapsed-time comparisons. The main remaining process cost is worker startup/IPC and pool teardown, not individual fingerprint arithmetic.
+
+Reproduce the current isolated benchmark with `uv run python benchmarks/benchmark.py --records 20000 --workers 4 --rounds 5000 --runs 3`. Reproduce end-to-end with `uv run python benchmarks/benchmark_pipeline.py --records 5000 --workers 4 --rounds 5000 --batch-size 500 --runs 3`. The 3x target was **not achieved**. Do not opt into process execution for this workload; keep `execution = "auto"` or `"sequential"` unless a different real workload and host benchmark demonstrates a win.
+
+## In-memory daily aggregation PyArrow fast path (2026-11-22)
+
+`benchmarks/benchmark_aggregation.py` compares `_aggregate_daily_python`, the exact `Fraction` reference/fallback implementation, with the public `aggregate_daily` API. Both receive the same deterministic input and metrics, and include input conversion, native validation/grouping, conversion back, and sorted output. Timed repetitions are interleaved with no RSS sampler running. Memory is measured in fresh worker processes; the parent samples the worker process tree and reports peak RSS and USS. The machine used Windows 10 build 19045, Python 3.14.7, PyArrow 23.0.1, Intel64 Family 6 Model 69 Stepping 1, four logical CPUs. Input had 28 dates and sum/count/min/max metrics.
+
+| Rows | Arrow batch size | Runs | Python exact median | PyArrow median | Speed-up | Exact RSS / USS | Arrow RSS / USS | Normalized outputs |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 50,000 | 50,000 (default) | 15 | 0.462349 s | 0.135278 s | 3.42x | 49,340,416 / 32,169,984 bytes | 65,220,608 / 43,261,952 bytes | Equal |
+| 50,000 | 5,000 | 11 | 0.509039 s | 0.228154 s | 2.23x | 49,225,728 / 32,055,296 bytes | 63,504,384 / 43,098,112 bytes | Equal |
+| 200,000 | 5,000 | 3 | 1.879496 s | 0.760609 s | 2.47x | 91,148,288 / 73,977,856 bytes | 104,296,448 / 83,918,848 bytes | Equal |
+
+The fresh 50,000-row/default-batch run achieved 3.42x (15 interleaved runs), while fresh-process measurements with 5,000-row Arrow batches were 2.23x for 50,000 rows and 2.47x for 200,000 rows. Thus the in-memory 3x objective is demonstrated for the 50,000-row dataset only when the whole dataset fits in one bounded Arrow table; it is not met with a 5,000-row batch or by the disk-backed end-to-end pipeline. Peak USS grew by about 39.8 MiB for Python and 38.9 MiB for Arrow when input grew from 50,000 to 200,000 rows; this is expected because the public in-memory API receives and retains the complete caller-owned list. For 50,000 rows with the 5,000-row Arrow batch, Arrow used about 10.5 MiB more USS than exact Python, including imports, input construction, and native buffers. The batch limits Arrow table materialization, not the API's input or output lists. RSS/USS are independently sampled and can miss a very brief peak; RSS sums process-tree resident pages while USS estimates unique pages. Reproduce with `uv run python benchmarks/benchmark_aggregation.py --records 50000 --batch-size 50000 --runs 15` and scale `--records` or vary `--batch-size` to inspect growth. Results depend on Python/PyArrow builds, CPU, and background load.
+
+### Exact-sum compatibility note
+
+The exact Python sum path is intentionally a semantic change from the implementation in commit `aaf8d99`, which used built-in `sum()` over floats and therefore rounded after each addition. The current implementation sums each finite float as an exact `Fraction` and rounds once when converting the final result back to float. For example, `[1e16, 1.0, -1e16]` produces `0.0` with the old built-in sum and `1.0` with the current exact sum. The output schema is unchanged, but some aggregate values can differ for cancellation-sensitive input. Exact accumulation aligns the in-memory path with disk-backed aggregation and is retained to satisfy the pipeline's exact-sum requirement; callers depending on historical order-dependent floating results should account for this behavior change.
+
+The native path is limited to bounded batches and exact integer/null Arrow columns. Sum fields additionally require every integer and a conservative cumulative absolute-sum bound to be at most 2^53, proving exact conversion and every possible partial sum. Fractional floats, booleans, non-finite values, unsafe sum bounds, unsupported Arrow values, or noncanonical/invalid dates route the full call to the exact Python path. Integer min/max is allowed without the sum bound because integer ordering is monotonic under the final Python int-to-float conversion. The API retains its existing in-memory record collection; only Arrow table materialization is batch-bounded.
+
+### Streaming pipeline comparison
+
+`benchmarks/benchmark_aggregation_pipeline.py` compares the exact per-record `DiskTransformProcessor` path (Arrow summary helper disabled) with the integrated Arrow batch path through JSONL reading, Pydantic validation, SQLite state, output commits, checkpoint handling, and final output. It uses independent fresh worker processes for memory sampling. It generates one input file in the parent, then each worker runs against that same file. Memory includes pipeline imports, SQLite, output/state buffers, and the Python process tree. Normalized final outputs are compared.
+
+| Rows | Sink batch | Runs | Mode | Median elapsed | Throughput | Peak tree RSS / USS |
+|---:|---:|---:|---|---:|---:|---:|
+| 20,000 | 5,000 | 3 (previous timing) | Exact per-record disk state | 3.067 s | 6,522 records/s | Previous same-process sample; not comparable |
+| 20,000 | 5,000 | 3 (previous timing) | Arrow batch summaries | 1.486 s | 13,457 records/s | Previous same-process sample; not comparable |
+| 20,000 | 1,000 | 3 (previous timing) | Exact per-record disk state | 3.692 s | 5,417 records/s | Previous same-process sample; not comparable |
+| 20,000 | 1,000 | 3 (previous timing) | Arrow batch summaries | 2.505 s | 7,985 records/s | Previous same-process sample; not comparable |
+| 20,000 | 5,000 | 2 | Exact per-record disk state | 3.373 s | 5,929 records/s | 80,404,480 / 53,239,808 bytes |
+| 20,000 | 5,000 | 2 | Arrow batch summaries | 1.476 s | 13,546 records/s | 87,576,576 / 55,414,784 bytes |
+| 5,000 | 1,000 | 2 | Exact per-record disk state | 1.246 s | 4,014 records/s | 71,356,416 / 44,191,744 bytes |
+| 5,000 | 1,000 | 2 | Arrow batch summaries | 1.011 s | 4,946 records/s | 82,268,160 / 53,780,480 bytes |
+
+The complete pipeline measured 2.28x in the fresh two-run 20,000-row/5,000-batch comparison and 1.23x for the 5,000-row/1,000-batch comparison; both output pairs were equal and both remain below 3x. Fresh-process USS was approximately 2.2 MiB higher for Arrow at 20,000 rows/5,000 batch and 9.1 MiB higher for Arrow at 5,000 rows/1,000 batch. Fixed interpreter/import costs and SQLite/Arrow buffers are significant at small sizes. Two timing repetitions are exploratory and noisier than the earlier three-run measurements. Reproduce with `uv run python benchmarks/benchmark_aggregation_pipeline.py --records 20000 --batch-size 5000 --runs 3` or `--records 5000 --batch-size 1000 --runs 3`. The disk fast path applies to batches of at least 1,000 valid records with safe Arrow-convertible fields. Smaller batches and unsafe records retain the exact per-record path.

@@ -17,6 +17,7 @@ from datapipe.core.exceptions import TransformStateError
 from datapipe.sinks.jsonl import JSONLSink
 from datapipe.transforms.aggregation import aggregate_daily
 from datapipe.transforms.deduplication import deduplicate
+from datapipe.transforms.parallel import FingerprintExecutor, _fingerprint
 from datapipe.transforms.state import DiskTransformProcessor
 
 
@@ -43,6 +44,56 @@ def test_disk_dedup_preserves_first_seen_and_python_key_equality(tmp_path: Path)
         assert state.duplicates == 3
         assert len(state.pending_updates()) == 2
     finally:
+        state.close()
+
+
+def test_disk_aggregation_overflow_matches_in_memory_sign(tmp_path: Path) -> None:
+    transform = {
+        "type": "aggregation",
+        "settings": {"date_field": "date", "metrics": {"value": "sum"}},
+    }
+    state = _state(tmp_path, [transform])
+    try:
+        for value in (1e308, 1e308):
+            assert state.process({"date": "2026-01-01", "value": value}) is None
+        actual = list(state.aggregate_rows(0, "date", None))
+        assert actual == [{"date": "2026-01-01", "value_sum": float("inf")}]
+        assert actual == aggregate_daily(
+            [
+                {"date": "2026-01-01", "value": 1e308},
+                {"date": "2026-01-01", "value": 1e308},
+            ],
+            "date",
+            {"value": "sum"},
+        )
+    finally:
+        state.close()
+
+
+def test_stateful_processor_batches_fingerprints_before_deduplication(tmp_path: Path) -> None:
+    rows = [
+        {"id": "first", "value": 7},
+        {"id": "second", "value": -3},
+        {"id": "first", "value": 99},
+    ]
+    state = _state(
+        tmp_path,
+        [
+            {"type": "cpu_fingerprint", "settings": {"field": "value", "rounds": 50}},
+            {"type": "deduplication", "settings": {"key": "id"}},
+        ],
+    )
+    executor = FingerprintExecutor("process", workers=2)
+    try:
+        outcomes = state.process_many(rows, fingerprint_executors={0: executor})
+        actual = [row for row, error in outcomes if row is not None and error is None]
+        assert actual == [
+            {"id": "first", "value": 7, "fingerprint": _fingerprint(7, 50)},
+            {"id": "second", "value": -3, "fingerprint": _fingerprint(-3, 50)},
+        ]
+        assert state.duplicates == 1
+    finally:
+        executor.close()
         state.close()
 
 
@@ -179,6 +230,151 @@ async def test_aggregation_is_incremental_and_only_rewrites_dirty_days(tmp_path:
     assert len([row for row in all_rows if row["date"] == "2026-01-01"]) == 2
     third = await run_pipeline(config)
     assert third["records_written"] == 0
+
+
+@pytest.mark.asyncio
+async def test_disk_arrow_aggregation_merges_batches_and_resumes_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datapipe.transforms import aggregation
+
+    source = tmp_path / "large-rows.jsonl"
+    output, checkpoint = tmp_path / "out", tmp_path / "checkpoint.json"
+    rows = [
+        {
+            "id": index,
+            "date": f"2026-01-{index % 2 + 1:02d}",
+            "value": index % 17,
+            "low": index % 11,
+            "high": index % 101,
+        }
+        for index in range(5_000)
+    ]
+    source.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    calls = 0
+    original = aggregation._run_arrow_group_by
+
+    def observe(table: Any, specs: list[tuple[str, str]]) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(table, specs)
+
+    monkeypatch.setattr(aggregation, "_run_arrow_group_by", observe)
+    metrics = {"value": "sum", "id": "count", "low": "min", "high": "max"}
+    config = _pipeline(
+        source,
+        output,
+        checkpoint,
+        [{"type": "aggregation", "settings": {"date_field": "date", "metrics": metrics}}],
+        batch=1_000,
+    )
+    first = await run_pipeline(config)
+    assert first["records_written"] == 2
+    assert calls == 5
+
+    appended = [
+        {
+            "id": index + 5_000,
+            "date": f"2026-01-{index % 2 + 1:02d}",
+            "value": index % 17,
+            "low": index % 11,
+            "high": index % 101,
+        }
+        for index in range(5_000)
+    ]
+    with source.open("a", encoding="utf-8") as stream:
+        stream.writelines(json.dumps(row) + "\n" for row in appended)
+    second = await run_pipeline(config)
+    assert second["records_written"] == 2
+    assert calls == 10
+
+    all_rows = _ordered_output(output)
+    latest = {
+        row["date"]: row
+        for row in all_rows
+    }
+    expected = aggregate_daily(
+        rows + appended,
+        "date",
+        {"value": "sum", "id": "count", "low": "min", "high": "max"},
+    )
+    assert latest == {row["date"]: row for row in expected}
+
+
+@pytest.mark.asyncio
+async def test_disk_arrow_aggregate_replays_after_checkpoint_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "checkpoint-rows.jsonl"
+    rows = [
+        {"id": index, "date": "2026-02-01", "value": index % 19}
+        for index in range(5_000)
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    output, checkpoint = tmp_path / "out", tmp_path / "checkpoint.json"
+    config = _pipeline(
+        source,
+        output,
+        checkpoint,
+        [
+            {
+                "type": "aggregation",
+                "settings": {"date_field": "date", "metrics": {"value": "sum", "id": "count"}},
+            }
+        ],
+        batch=5_000,
+    )
+    original = Checkpoint.save
+
+    def fail_first_checkpoint(self: Checkpoint, value: dict[str, Any]) -> None:
+        monkeypatch.setattr(Checkpoint, "save", original)
+        raise OSError("injected checkpoint failure after output commit")
+
+    monkeypatch.setattr(Checkpoint, "save", fail_first_checkpoint)
+    with pytest.raises(ExceptionGroup):
+        await run_pipeline(config)
+
+    recovered = await run_pipeline(config)
+    assert recovered["records_written"] == 1
+    assert _ordered_output(output) == [
+        {"date": "2026-02-01", "value_sum": float(sum(row["value"] for row in rows)), "id_count": 5_000}
+    ]
+
+
+def test_disk_process_many_unsafe_metric_uses_exact_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datapipe.transforms import aggregation
+
+    rows = [
+        {"date": "2026-03-01", "value": index % 7, "id": index}
+        for index in range(1_000)
+    ]
+    rows[-1]["value"] = 0.1
+
+    def fail_if_native(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("fractional metric must use exact row processing")
+
+    monkeypatch.setattr(aggregation, "_run_arrow_group_by", fail_if_native)
+    state = _state(
+        tmp_path,
+        [
+            {
+                "type": "aggregation",
+                "settings": {"date_field": "date", "metrics": {"value": "sum", "id": "count"}},
+            }
+        ],
+    )
+    try:
+        outcomes = state.process_many(rows)
+        assert all(result is None and error is None for result, error in outcomes)
+        assert list(state.aggregate_rows(0, "date", None)) == aggregate_daily(
+            rows, "date", {"value": "sum", "id": "count"}
+        )
+    finally:
+        state.close()
 
 
 @pytest.mark.asyncio

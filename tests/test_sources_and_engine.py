@@ -8,7 +8,13 @@ import pytest
 from aiohttp import web
 
 from datapipe.config.schema import PipelineConfig, SourceConfig
-from datapipe.core.engine import _blocking_to_completion, _source, _transform_record, run_pipeline
+from datapipe.core.engine import (
+    _blocking_to_completion,
+    _source,
+    _transform_record,
+    _transform_records,
+    run_pipeline,
+)
 from datapipe.plugins.discovery import discover
 from datapipe.plugins.registry import SourceRegistry
 from datapipe.sinks.jsonl import JSONLSink
@@ -87,6 +93,56 @@ def test_fingerprint_transform_preserves_non_numeric_values() -> None:
     )
     row = {"id": "record", "value": "opaque"}
     assert _transform_record(row, config) == row
+
+
+def test_batch_transforms_mapping_filtering_and_filtered_rows() -> None:
+    from datapipe.transforms.parallel import _fingerprint
+
+    config = PipelineConfig.model_validate(
+        {
+            "name": "batch-map-filter",
+            "sources": [{"name": "input", "type": "jsonl", "path": "unused.jsonl"}],
+            "transforms": [
+                {"type": "mapping", "settings": {"fields": {"value": "amount"}}},
+                {
+                    "type": "filtering",
+                    "settings": {"field": "amount", "op": "gt", "value": 2},
+                },
+                {
+                    "type": "cpu_fingerprint",
+                    "settings": {"field": "amount", "rounds": 4},
+                },
+            ],
+            "sink": {"type": "jsonl", "output_dir": "unused-output"},
+        }
+    )
+    outcomes = _transform_records([{"value": 1}, {"value": 3}], config, {})
+    assert outcomes[0] == (None, None)
+    assert outcomes[1] == ({"amount": 3, "fingerprint": _fingerprint(3, 4)}, None)
+
+
+def test_batch_transform_isolates_invalid_fingerprint_value() -> None:
+    from datapipe.transforms.parallel import _fingerprint
+
+    config = PipelineConfig.model_validate(
+        {
+            "name": "batch-invalid-fingerprint",
+            "sources": [{"name": "input", "type": "jsonl", "path": "unused.jsonl"}],
+            "transforms": [
+                {"type": "cpu_fingerprint", "settings": {"field": "value", "rounds": 4}},
+                {"type": "mapping", "settings": {"fields": {"value": "renamed"}}},
+            ],
+            "sink": {"type": "jsonl", "output_dir": "unused-output"},
+        }
+    )
+    outcomes = _transform_records(
+        [{"value": float("nan")}, {"value": 7}, {"other": 1}], config, {}
+    )
+    assert isinstance(outcomes[0][1], ValueError)
+    assert outcomes[0][0] is None
+    assert outcomes[1][0] == {"renamed": 7, "fingerprint": _fingerprint(7, 4)}
+    assert outcomes[1][1] is None
+    assert outcomes[2] == ({"other": 1}, None)
 
 
 @pytest.mark.asyncio
@@ -698,16 +754,26 @@ async def test_record_local_mapping_and_filtering_use_batched_stream_path(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("execution", ["auto", "thread", "process"])
 async def test_fingerprint_transform_uses_batched_stream_path(
-    tmp_path: Path, execution: str
+    tmp_path: Path, execution: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from datapipe.transforms.parallel import _fingerprint
+    from datapipe.transforms.parallel import FingerprintExecutor, _fingerprint
+
+    calls: list[int] = []
+    original_apply_many = FingerprintExecutor.apply_many
+
+    def spy_apply_many(self: FingerprintExecutor, values: Any, rounds: int) -> list[int]:
+        batch = list(values)
+        calls.append(len(batch))
+        return original_apply_many(self, batch, rounds)
+
+    monkeypatch.setattr(FingerprintExecutor, "apply_many", spy_apply_many)
 
     source = tmp_path / "fingerprint.jsonl"
-    source.write_text(
-        '{"id":"one","date":"2026-01-01","value":42}\n'
-        '{"id":"two","date":"2026-01-02","value":-7}\n',
-        encoding="utf-8",
-    )
+    values = [42, -7, 0, 999]
+    source.write_text("".join(
+        json.dumps({"id": f"record-{index}", "date": "2026-01-01", "value": value}) + "\n"
+        for index, value in enumerate(values)
+    ), encoding="utf-8")
     output = tmp_path / "out"
     config = PipelineConfig.model_validate(
         {
@@ -725,16 +791,71 @@ async def test_fingerprint_transform_uses_batched_stream_path(
                     },
                 }
             ],
-            "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 1},
+            "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 4},
         }
     )
     result = await run_pipeline(config)
-    assert result["records_written"] == 2
+    assert result["records_written"] == 4
     rows = [
-        json.loads(path.read_text(encoding="utf-8"))
+        json.loads(line)
         for path in sorted(output.glob("date=*/part-*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
     ]
-    assert [row["fp"] for row in rows] == [_fingerprint(42, 5000), _fingerprint(-7, 5000)]
+    assert [row["fp"] for row in rows] == [_fingerprint(value, 5000) for value in values]
+    assert calls == [4]
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_batches_after_disk_backed_aggregation(tmp_path: Path) -> None:
+    from datapipe.transforms.parallel import _fingerprint
+
+    source = tmp_path / "aggregate-fingerprint.jsonl"
+    source.write_text(
+        '{"id":"a","date":"2026-01-01","amount":2}\n'
+        '{"id":"b","date":"2026-01-01","amount":3}\n'
+        '{"id":"c","date":"2026-01-02","amount":7}\n'
+        '{"id":"d","date":"2026-01-03","amount":-4}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "aggregated-output"
+    config = PipelineConfig.model_validate(
+        {
+            "name": "aggregate-fingerprint-batch",
+            "sources": [{"name": "input", "type": "jsonl", "path": str(source)}],
+            "transforms": [
+                {
+                    "type": "aggregation",
+                    "settings": {"date_field": "date", "metrics": {"amount": "sum"}},
+                },
+                {
+                    "type": "cpu_fingerprint",
+                    "settings": {
+                        "field": "amount_sum",
+                        "output_field": "fp",
+                        "rounds": 40,
+                        "execution": "process",
+                        "workers": 2,
+                    },
+                },
+            ],
+            "sink": {"type": "jsonl", "output_dir": str(output), "batch_size": 2},
+        }
+    )
+
+    report = await run_pipeline(config)
+    actual = [
+        json.loads(line)
+        for part in output.glob("date=*/*.jsonl")
+        for line in part.read_text(encoding="utf-8").splitlines()
+    ]
+    actual.sort(key=lambda row: row["date"])
+    expected = [
+        {"date": "2026-01-01", "amount_sum": 5.0, "fp": _fingerprint(5, 40)},
+        {"date": "2026-01-02", "amount_sum": 7.0, "fp": _fingerprint(7, 40)},
+        {"date": "2026-01-03", "amount_sum": -4.0, "fp": _fingerprint(-4, 40)},
+    ]
+    assert actual == expected
+    assert report["records_written"] == 3
 
 
 @pytest.mark.asyncio

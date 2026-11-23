@@ -60,6 +60,24 @@ class FingerprintExecutor:
             return _fingerprint_fast(value, rounds)
         return self._pool.submit(_fingerprint_fast, value, rounds).result()
 
+    def apply_many(self, values: Iterable[int], rounds: int) -> list[int]:
+        """Fingerprint a batch with at most one task per worker.
+
+        The executor is retained across batches. This avoids one IPC/future
+        round trip per record while keeping task inputs to plain integer lists.
+        """
+        if rounds < 1:
+            raise ValueError("rounds must be positive")
+        items = list(values)
+        if not items:
+            return []
+        if self._pool is None:
+            return [_fingerprint_fast(value, rounds) for value in items]
+        chunks = _split_integer_chunks(items, self.workers)
+        tasks = [(chunk, rounds) for chunk in chunks]
+        results = self._pool.map(_fingerprint_chunk, tasks, chunksize=1)
+        return [value for result in results for value in result]
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
@@ -124,6 +142,12 @@ def _normalize_global(task: tuple[list[dict[str, Any]], str, float, float]) -> l
 def _fingerprint_chunk(task: tuple[list[int], int]) -> list[int]:
     values, rounds = task
     return [_fingerprint_fast(value, rounds) for value in values]
+
+
+def _split_integer_chunks(values: list[int], workers: int) -> list[list[int]]:
+    """Split records into balanced contiguous batches, never tiny per-row tasks."""
+    chunk_size = (len(values) + workers - 1) // workers
+    return [values[index : index + chunk_size] for index in range(0, len(values), chunk_size)]
 
 
 def _fingerprint(value: int, rounds: int) -> int:
@@ -209,16 +233,13 @@ def fingerprint_records_parallel(
     )
     if len(positions_and_values) < 2 or workers < 2 or strategy == "sequential":
         return fingerprint_records(items, field, output_field, rounds)
-    chunk_size = (len(positions_and_values) + workers - 1) // workers
-    chunks = [
-        positions_and_values[index : index + chunk_size]
-        for index in range(0, len(positions_and_values), chunk_size)
-    ]
-    tasks = [([value for _, value in chunk], rounds) for chunk in chunks]
-    executor_type = ProcessPoolExecutor if strategy == "process" else ThreadPoolExecutor
-    with executor_type(max_workers=workers) as pool:
-        results = list(pool.map(_fingerprint_chunk, tasks))
-    for chunk, fingerprints in zip(chunks, results, strict=True):
-        for (index, _), fingerprint in zip(chunk, fingerprints, strict=True):
-            items[index][output_field] = fingerprint
+    positions = [index for index, _ in positions_and_values]
+    values = [value for _, value in positions_and_values]
+    executor = FingerprintExecutor(strategy, workers)
+    try:
+        fingerprints = executor.apply_many(values, rounds)
+    finally:
+        executor.close()
+    for index, fingerprint in zip(positions, fingerprints, strict=True):
+        items[index][output_field] = fingerprint
     return items
