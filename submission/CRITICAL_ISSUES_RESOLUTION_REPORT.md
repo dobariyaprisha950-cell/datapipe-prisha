@@ -3,21 +3,27 @@
 Date: 2026-11-24
 Project version: `datapipe-prisha` 0.1.0
 
-## Update after final commit/push authorization
+## Update after authorized commit, push, and Ubuntu CI
 
-The user explicitly authorized staging, committing, pushing to the existing repository, and awaiting Ubuntu CI. The approved file set is the six modified project files listed below, `scripts/verify_sdist.py`, the five presentation files, and this report. The separate `submission/demo-video/` directory is outside this task and is excluded from the commit.
+**Implementation commit:** `237c3def3502c8658333dd790cb75dc1613cb69a` — `feat: verify source distributions and add project presentation`. It was pushed to the existing `origin/master` branch without force-pushing. The remote `master` reference was independently checked and points to this exact SHA.
 
-A fresh worktree review found exactly five presentation files. PPTX and DOCX ZIP integrity checks passed (8 slides and 8 note pages in the PPTX); XML/text scans found no email addresses or credential patterns. `git diff --check` passed. The current `BENCHMARKS.md` retains the measured pooled 3.33x result for the specific 50,000-row, 50,000-row-batch in-memory workload with equal normalized outputs; no benchmark methodology or measurement was changed in this task.
+- Repository: [dobariyaprisha950-cell/datapipe-prisha](https://github.com/dobariyaprisha950-cell/datapipe-prisha)
+- Commit: [237c3def3502c8658333dd790cb75dc1613cb69a](https://github.com/dobariyaprisha950-cell/datapipe-prisha/commit/237c3def3502c8658333dd790cb75dc1613cb69a)
+- Ubuntu CI run: [run 45431931687](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687) — completed successfully for Python 3.12 and 3.13.
+- Python 3.13 job: [checks (3.13)](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687/job/138579340935) — success.
+- Python 3.12 job: [checks (3.12)](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687/job/138579341432) — success.
 
-Remote repository: [dobariyaprisha950-cell/datapipe-prisha](https://github.com/dobariyaprisha950-cell/datapipe-prisha), branch `master`. Read-only `git -c http.sslbackend=openssl ls-remote origin refs/heads/master` confirmed the remote still pointed to baseline `767d48199ef4d27f14bf1169af3ad65d4c8606df`. The default Schannel Git transport failed with `SEC_E_NO_CREDENTIALS`; `gh` is not installed. A local `git fetch` also could not write `.git/FETCH_HEAD`. No commit or push has yet been verified from this execution environment.
+The full pytest and core branch-coverage steps passed on both Ubuntu jobs. The explicit `POSIX SIGINT and SIGTERM integration tests` step passed on both versions. That parametrized test sends real SIGINT and SIGTERM after a batch is committed, checks checkpoint/staging state, resumes the same pipeline, and asserts a final cursor and exactly 250,000 output records. Both sdist inspection and clean sdist install/sample smoke steps also passed on both versions. The commit is therefore backed by actual Linux signal, checkpoint, and resume test execution—not just workflow configuration.
 
-Linux evidence: **NOT RUN**. The Ubuntu workflow is configured to run both SIGINT and SIGTERM subprocess cases. Each case sends the real signal after a batch is committed, checks the checkpoint/staging state, resumes the pipeline, and asserts a final cursor of 250,000 plus exactly 250,000 output records. Only a successful Ubuntu Actions run can satisfy this criterion. No GitHub Actions result is claimed in this update.
+GitHub's contents API confirmed all five approved presentation files exist at the implementation commit. For example: [PowerPoint](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Presentation.pptx), [DOCX script](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Speaking_Script.docx), [TXT script](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Speaking_Script.txt), [recording guide](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_Demo_Recording_Guide.md), and [validation report](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_Presentation_Validation.md).
 
-Commit hash: **none verified yet**. GitHub commit/file URLs and Ubuntu run links will be added only after an authenticated push and successful workflow run. Until then the final verdict remains **NOT READY**.
+The latest `BENCHMARKS.md` evidence remains the measured pooled **3.33x** exact-Python versus PyArrow result for the 50,000-row, 50,000-row-batch in-memory workload, with equal normalized outputs. No benchmark methods or benchmark results were changed for this task. The presentation script's 3.09x figure and its RSS values refer to earlier measured runs; they are historical values, while `BENCHMARKS.md` records the later 3.33x result. The separate `submission/demo-video/` directory was excluded from the commit as requested and remains untracked.
+
+**Current verdict: READY.** GitHub commit/file verification and real Ubuntu SIGINT/SIGTERM checkpoint-resume tests have passed.
 
 ## Executive result
 
-**NOT READY — two acceptance criteria are still incomplete.** The in-memory benchmark target and source-distribution cleanup both passed local verification. Linux SIGTERM/resume has not run on Linux, and the approved presentation files could not be staged, committed, or pushed because the automatic approval review rejected Git index writes under the earlier read-only audit instruction. No Git history or remote was changed.
+**READY — the measured in-memory benchmark target, source-distribution checks, GitHub publication of the approved change set, and real Ubuntu SIGINT/SIGTERM checkpoint-resume tests all passed.** Details and direct GitHub links are in the update above.
 
 ## 1. Performance below 3x
 
@@ -72,33 +78,30 @@ The old contaminated archive was also passed to the new checker; it was rejected
 
 ## 3. Linux SIGTERM and resume
 
-**Local environment:** WSL returned `Wsl/E_ACCESSDENIED`; Docker was not installed. Windows is not valid evidence for POSIX signal behavior, and the two signal tests were skipped there.
+**Ubuntu Actions evidence:** workflow run [45431931687](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687) completed successfully at implementation commit `237c3def3502c8658333dd790cb75dc1613cb69a` on both `ubuntu-latest` Python 3.12 and Python 3.13.
 
-**Workflow:** `.github/workflows/ci.yml` already runs on Ubuntu with Python 3.12 and 3.13 and explicitly runs `pytest tests/test_signal_shutdown.py -vv`. It was updated to also inspect the sdist and install/run its sample in a fresh environment. `.github/workflows/release-testpypi.yml` received the same sdist verification before any trusted publishing step. Both workflow YAML files parsed locally.
+For both matrix jobs, the complete pytest step, the explicit `POSIX SIGINT and SIGTERM integration tests` step, the core branch-coverage enforcement step, source-distribution verification, and isolated sdist install/sample smoke step all completed with success. The POSIX test parameterizes real SIGINT and SIGTERM subprocess interruption. Each scenario waits for an output batch to be committed, signals the running process, verifies the checkpoint and empty staging directory, resumes the pipeline, then asserts cursor 250,000 and exactly 250,000 records across final partitions. The test thus covers signal delivery, checkpoint persistence, resume, and no record loss/duplication on Ubuntu.
 
-**Linux evidence:** no Ubuntu Actions run was available during this session. The changes could not be pushed, so the new CI steps have not executed remotely. Therefore SIGTERM delivery, checkpoint consistency, resumed-versus-uninterrupted output, and POSIX filesystem behavior remain unverified here.
+- [Python 3.13 job and step results](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687/job/138579340935)
+- [Python 3.12 job and step results](https://github.com/dobariyaprisha950-cell/datapipe-prisha/actions/runs/45431931687/job/138579341432)
 
-**Acceptance:** NOT VERIFIED. After the approved changes are pushed, inspect the Ubuntu matrix jobs and confirm that `POSIX SIGINT and SIGTERM integration tests` and the sdist smoke step pass. Do not treat the Windows skips as Linux results.
+**Acceptance:** PASS. This is actual Linux Actions execution; earlier Windows skips are not used as POSIX evidence.
 
 ## 4. GitHub presentation files
 
-The five approved deliverables are present locally:
+The approved five deliverables are committed at `237c3def3502c8658333dd790cb75dc1613cb69a` and each was confirmed present by GitHub's contents API:
 
-- `presentation/DATAPIPE_5_Minute_Presentation.pptx`
-- `presentation/DATAPIPE_5_Minute_Speaking_Script.docx`
-- `presentation/DATAPIPE_5_Minute_Speaking_Script.txt`
-- `presentation/DATAPIPE_Demo_Recording_Guide.md`
-- `presentation/DATAPIPE_Presentation_Validation.md`
+- [PowerPoint](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Presentation.pptx)
+- [DOCX speaking script](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Speaking_Script.docx)
+- [TXT speaking script](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_5_Minute_Speaking_Script.txt)
+- [Demo recording guide](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_Demo_Recording_Guide.md)
+- [Presentation validation](https://github.com/dobariyaprisha950-cell/datapipe-prisha/blob/237c3def3502c8658333dd790cb75dc1613cb69a/presentation/DATAPIPE_Presentation_Validation.md)
 
-Validation found eight slides and eight speaker-note pages. The PPTX and DOCX archives passed ZIP integrity checks; the script narration in the PPTX notes, DOCX, and TXT matched. The updated narration has 628 words, estimated at 5.02 minutes at 125 words/minute. The five files were scanned for credential patterns and email addresses; none were found.
+Before staging, the five files passed package-integrity and text/security inspection. The PowerPoint contains 8 slides and 8 note pages; DOCX/PPTX ZIP integrity passed; no credential patterns or email addresses were found in the scanned content. The presentation's 3.09x and RSS numbers are from earlier actual measurements; the latest verified 3.33x comparison remains in `BENCHMARKS.md` and is not replaced by those historical figures.
 
-A factual correction was made in the slide, notes, script and validation docs: branch-only coverage is **86.23% (238/276)**, while pytest's combined statement-and-branch total is **91.41%**. This fixes an earlier mislabeled 91.31% figure. No source video was created or edited.
+**Git state:** branch `master`; at verification time, remote `master` matched implementation commit `237c3def3502c8658333dd790cb75dc1613cb69a`. The report-only follow-up does not change implementation or benchmark files. The implementation commit contains the six approved tracked project files, `scripts/verify_sdist.py`, and the five presentation files. This report records the later CI evidence in a documentation-only follow-up commit. The separate untracked `submission/demo-video/` directory was deliberately excluded. `uv.lock` was not changed; no package was published.
 
-**Git state before requested commit:** branch `master`, starting HEAD `767d48199ef4d27f14bf1169af3ad65d4c8606df`, configured remote name `origin` targeting the repository supplied by the user. The presentation files and code changes remain unstaged. No commit or push was made. There is no `index.lock` file; no Git process was running when checked.
-
-**Blocker:** the staging command was rejected by automatic approval review because an earlier final-audit instruction in this conversation prohibited staging. The rejection explicitly instructed not to bypass it. The current task does request staging/commit/push, but approval review did not accept the conflicting instruction update. No attempt was made to work around that rejection. Remote branch contents and push status could not be verified during this session.
-
-**Acceptance:** INCOMPLETE. The files are not committed, pushed, or remotely verified.
+**Acceptance:** PASS.
 
 ## Validation commands and results
 
@@ -123,23 +126,19 @@ A factual correction was made in the slide, notes, script and validation docs: b
 - The five presentation files listed above
 - `submission/CRITICAL_ISSUES_RESOLUTION_REPORT.md` (this report)
 
-No dependency metadata or `uv.lock` changes were made. No package was published. No files were committed or pushed.
+No dependency metadata or `uv.lock` changes were made. No package was published. Commit `237c3def3502c8658333dd790cb75dc1613cb69a` was pushed to `origin/master`; the Ubuntu CI run passed.
 
 ## Acceptance summary
 
-| Critical issue | Status | Evidence / remaining requirement |
+| Critical issue | Status | Evidence |
 |---|---|---|
-| Performance | PASS | Three 15-run interleaved sessions and pooled 3.33x for the specific 50k-row/50k-batch in-memory workload; other workloads remain below 3x. |
-| Source distribution | PASS | Fresh 34-entry archive excludes development artifacts; isolated install and sample execution passed. |
-| Linux SIGTERM/resume | NOT VERIFIED | Ubuntu CI workflow is configured, but no Linux run occurred. Push and successful Actions run are required. |
-| GitHub presentation files | INCOMPLETE | Five files are local and reviewed but not staged, committed, pushed, or remotely verified. Automatic approval review blocked staging. |
+| Performance | PASS | Three 15-run interleaved sessions and pooled 3.33x for the specific 50k-row/50k-batch in-memory workload; normalized outputs equal. Other workloads remain below 3x. |
+| Source distribution | PASS | Fresh 34-entry archive excludes development artifacts; Ubuntu CI inspection, clean sdist installation, and sample smoke passed on Python 3.12 and 3.13. |
+| Linux SIGTERM/checkpoint/resume | PASS | Ubuntu CI run 45431931687 passed on both Python versions. Both real signal cases resumed and asserted cursor/output count 250,000. |
+| GitHub presentation files | PASS | All five files are linked above and verified present at implementation commit `237c3def...`, which is in the remote `master` history. |
 
-## Exact remaining actions
+## Remaining actions
 
-1. Resolve the approval conflict so the reviewed paths can be staged and committed. The rejected operation was `git add` writing `.git/index`; the system explicitly prohibited a workaround.
-2. Commit only the listed source/config/docs/workflow changes, the five presentation files, and this report; do not include ignored `work/` build/test outputs.
-3. Push the commit to the existing `master` branch and verify the remote branch points to that exact commit.
-4. Wait for and inspect the Ubuntu Python 3.12/3.13 CI runs. Confirm the POSIX signal/resume tests and clean sdist installation/sample smoke tests pass.
-5. If any Ubuntu test fails, fix it while preserving Windows behavior, then repeat validation.
+No remaining action is required for the approved DATAPIPE change set, GitHub verification, or Linux SIGTERM/checkpoint/resume acceptance criteria. The separate video directory was intentionally excluded from this task and remains outside the commit.
 
-Final verdict: **NOT READY — one or more acceptance criteria remain incomplete.**
+Final verdict: **READY — GitHub verification and real Linux signal/checkpoint/resume tests passed.**
