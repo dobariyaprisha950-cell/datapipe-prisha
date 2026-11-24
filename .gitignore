@@ -1,4 +1,6 @@
 .venv/
+.venv-demo/
+.hypothesis/
 work/
 __pycache__/
 *.py[cod]
@@ -11,5 +13,7 @@ build/
 examples/output*/
 .env
 .coverage
+.coverage.*
 htmlcov/
 .datapipe/
+/outputs/

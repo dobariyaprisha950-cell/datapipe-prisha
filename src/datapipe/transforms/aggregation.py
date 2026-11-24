@@ -134,9 +134,7 @@ def _aggregate_grouped_arrow(
 
     results: dict[str, _DailyArrowSummary] = {}
     absolute_sums = {field: 0 for field, op in metric_items if op == "sum"}
-    batch: list[dict[str, Any]] = []
-
-    def flush_batch() -> bool:
+    def flush_batch(batch: Sequence[Mapping[str, Any]]) -> bool:
         if not batch:
             return True
         try:
@@ -214,17 +212,22 @@ def _aggregate_grouped_arrow(
                         if operation == "min"
                         else max(previous, value)
                     )
-        batch.clear()
         return True
 
     for offset in range(0, len(records), batch_size):
-        batch.extend(records[offset : offset + batch_size])  # type: ignore[arg-type]
+        # Use the record sequence directly for a single batch and one slice
+        # for each later bounded batch. Extending a second list from a slice
+        # duplicates the per-row reference array without helping Arrow's
+        # conversion, which accepts any Python sequence.
+        batch = (
+            records
+            if offset == 0 and len(records) <= batch_size
+            else records[offset : offset + batch_size]
+        )
         # Arrow conversion failures preserve custom Mapping implementations
         # through the exact fallback.
-        if not flush_batch():
+        if not flush_batch(batch):
             return None
-    if not flush_batch():
-        return None
 
     # The exact Python implementation returns floats for numeric min/max.
     for summary in results.values():

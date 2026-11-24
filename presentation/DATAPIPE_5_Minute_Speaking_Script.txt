@@ -1,0 +1,42 @@
+DATAPIPE — 5-Minute Demo Speaking Script
+Target pace: about 125 words per minute
+
+SLIDE 1: DATAPIPE | A dependable data pipeline
+Timing: 0:00-0:30
+Screen: Show slide 1
+Hello. Today I am presenting DATAPIPE, a Python command-line data pipeline. It reads records from files and HTTP JSON sources, checks every record, applies configured steps, and writes results in useful formats. I built this project to handle real pipeline concerns, including concurrent sources, invalid data, safe output commits, and restart after interruption. I will show the design, run flow, plugin, and measured results.
+
+SLIDE 2: From sources to committed output
+Timing: 0:30-1:08
+Screen: Trace the diagram from left to right
+The architecture separates sources, pipeline stages, and sinks. HTTP, CSV, JSONL, and installed plugins provide records. Async source tasks feed a bounded queue. That queue applies backpressure when the consumer is busy, so producers cannot grow memory without limit. Pydantic checks records at the boundary. Valid records go through configured transformations. Invalid records go to a dead-letter file with their source and reason. Finally, the sink writes JSONL or Parquet partitions. A journal ties output batches to source checkpoints.
+
+SLIDE 3: Published package and fresh environment
+Timing: 1:08-1:42
+Screen: Show the installation commands
+I published version zero point one point zero to TestPyPI. To verify it, I created a separate virtual environment. The command installs runtime dependencies from the normal Python package index, then installs the DATAPIPE wheel from TestPyPI without pulling dependencies from there. I checked the package version and import path. The import came from the environment’s site-packages folder, which confirms this test did not load the local source tree. This is a repeatable release smoke test.
+
+SLIDE 4: Configuration and CLI workflow
+Timing: 1:42-2:20
+Screen: Show PowerShell and the config file
+The command line gives a small, clear workflow. First, I show the installed version and help. Next, I validate a YAML pipeline before running it. The demo pipeline has two local sources and configured mapping and deduplication. For a recording, I use a new output and checkpoint path so I do not overwrite earlier results. The run command can print machine-readable JSON, which is useful for scripts. A dry run can inspect a pipeline without committing output.
+
+SLIDE 5: One run from raw input to committed output
+Timing: 2:20-3:03
+Screen: Show the two input files, then the output folder
+The sample reads four rows from CSV and three lines from JSONL. Four records pass validation. Three go to dead-letter output: two fail record validation, and one line contains malformed JSON. Mapping renames the amount field. Deduplication removes one repeated identifier. The run writes three valid records into date partitions, and the report summarizes the counts. Dead letters keep the original input and a useful reason, so problems do not disappear silently.
+
+SLIDE 6: Third-party sources use Python entry points
+Timing: 3:03-3:35
+Screen: Show the plugin package and CLI output
+DATAPIPE also supports third-party sources. The example plugin is a separate package with a Python entry point named sample. After installation, DATAPIPE discovers it and includes it in the plugin registry. I verified that list-plugins showed the source. I then ran a pipeline configured to use that plugin, and it produced one valid output record. This demonstrates an extension point without putting plugin code inside the main application.
+
+SLIDE 7: Measured results and validation
+Timing: 3:35-4:30
+Screen: Point to the chart, then the test and memory results
+I measured the exact Python aggregation path against the PyArrow path with the same 50,000-row dataset. Fifteen interleaved runs gave median times of 0.417812 and 0.135114 seconds. That is a measured 3.09 times faster, and the normalized outputs matched exactly. This result applies to this in-memory workload and the 50,000-row Arrow batch. Other batch sizes and the full disk-backed pipeline were slower than 3 times. The run passed 147 tests with two POSIX signal tests skipped on Windows; branch-only coverage was 86.23 percent and combined coverage was 91.41 percent. Separate streaming deduplication tests processed two and five million records with similar RSS growth, while using more disk for the larger input.
+
+SLIDE 8: A working pipeline with evidence behind it
+Timing: 4:30-5:00
+Screen: Return to the title or leave the closing slide visible
+To close, DATAPIPE connects multiple inputs to validated and resumable output through a configurable Python CLI. The project includes an independently installed source plugin, recovery tests, large streaming checks, and a measured native aggregation fast path. The benchmark shows a clear improvement for one tested workload, with its limits documented. Building the project brought together API design, asynchronous processing, packaging, testing, and performance measurement. Thank you for watching. I am happy to answer questions.

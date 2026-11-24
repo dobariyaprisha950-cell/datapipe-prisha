@@ -114,6 +114,23 @@ The exact Python sum path is intentionally a semantic change from the implementa
 
 The native path is limited to bounded batches and exact integer/null Arrow columns. Sum fields additionally require every integer and a conservative cumulative absolute-sum bound to be at most 2^53, proving exact conversion and every possible partial sum. Fractional floats, booleans, non-finite values, unsafe sum bounds, unsupported Arrow values, or noncanonical/invalid dates route the full call to the exact Python path. Integer min/max is allowed without the sum bound because integer ordering is monotonic under the final Python int-to-float conversion. The API retains its existing in-memory record collection; only Arrow table materialization is batch-bounded.
 
+### 2026-11-24 remeasurement after removing a redundant batch-reference copy
+
+The Arrow path previously copied each bounded record slice into a second list before calling `Table.from_pylist`. It now passes the original record sequence for a single batch and one slice per batch otherwise. This removes a duplicate Python reference array without changing the input rows, aggregation, exact-safety checks, or output conversion. A separate paired A/B measurement of the public in-memory API used the 50,000-row benchmark input, the same 50,000-row batch and metrics, 30 alternating calls per implementation, warm-up before timing, and normalized-output checks on every call. The committed pre-change implementation had a 0.196845 s median; the updated implementation had a 0.180306 s median (1.092x). Outputs matched. This A/B result measures the allocation change, not speed relative to the exact-Python baseline.
+
+The required exact-Python-versus-PyArrow benchmark was then run three independent times with the existing command and 15 interleaved repetitions per run. Each run included exact normalized-output comparisons; timing did not overlap memory sampling. All three session medians exceeded 3x. Pooling the 45 raw timings per implementation gives 0.458573 s for exact Python and 0.137651 s for PyArrow, or 3.33x. The session-by-session results were:
+
+| Session | Exact Python median | PyArrow median | Speed-up | Outputs equal |
+|---:|---:|---:|---:|---|
+| 1 | 0.433413 s | 0.137608 s | 3.15x | Yes |
+| 2 | 0.669717 s | 0.172688 s | 3.88x | Yes |
+| 3 | 0.439245 s | 0.129903 s | 3.38x | Yes |
+| Pooled 45 timings | 0.458573 s | 0.137651 s | 3.33x | Yes |
+
+Environment and workload match the table above: Windows 10 build 19045, Python 3.14.7, PyArrow 23.0.1, Intel64 Family 6 Model 69 Stepping 1, four logical CPUs, 50,000 rows, 50,000-row Arrow batch, 28 dates and sum/count/min/max metrics. Separate fresh-process peak memory samples across the sessions were 49,324,032–49,397,760 bytes RSS / 32,145,408–32,219,136 bytes USS for exact Python and 62,214,144–62,697,472 bytes RSS / 39,374,848–39,825,408 bytes USS for PyArrow. The second session ran under substantially slower host timing for both modes; it is retained in the report, not discarded. The >=3x target is reproduced for this one in-memory workload and configuration. It is not a general pipeline or disk-backed speedup: the 5,000-row-batch and complete-pipeline measurements above remain below 3x. Reproduce with `uv run python benchmarks/benchmark_aggregation.py --records 50000 --batch-size 50000 --runs 15`.
+
+A warmed cProfile run on this same data (profiling is diagnostic, not part of the timing benchmark) attributed 1.158 s cumulative to `_aggregate_grouped_python`; `Fraction.from_float` accounted for 0.382 s and Fraction addition for 0.195 s. The Arrow implementation took 0.120 s cumulative in `_aggregate_grouped_arrow`; batch conversion/validation in `flush_batch` accounted for 0.120 s, Arrow compute wrappers 0.064 s, and the group-by kernel 0.008 s. This confirms that exact Fraction arithmetic dominates the reference path, while conversion and validation dominate the accelerated path; the group-by kernel itself is not the main remaining optimization opportunity.
+
 ### Streaming pipeline comparison
 
 `benchmarks/benchmark_aggregation_pipeline.py` compares the exact per-record `DiskTransformProcessor` path (Arrow summary helper disabled) with the integrated Arrow batch path through JSONL reading, Pydantic validation, SQLite state, output commits, checkpoint handling, and final output. It uses independent fresh worker processes for memory sampling. It generates one input file in the parent, then each worker runs against that same file. Memory includes pipeline imports, SQLite, output/state buffers, and the Python process tree. Normalized final outputs are compared.

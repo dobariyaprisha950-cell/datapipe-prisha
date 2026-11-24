@@ -24,3 +24,15 @@ jobs:
         run: uv run pytest tests/test_signal_shutdown.py -vv
       - run: uv run pip-audit
       - run: uv build
+      - name: Verify source distribution contents
+        run: uv run python scripts/verify_sdist.py dist/
+      - name: Install and smoke-test the source distribution
+        run: |
+          uv venv work/sdist-check --python '${{ matrix.python-version }}'
+          uv pip install --python work/sdist-check/bin/python dist/*.tar.gz
+          work/sdist-check/bin/python -c "import datapipe; from importlib.metadata import version; assert version('datapipe-prisha') == '0.1.0'; assert 'site-packages' in datapipe.__file__; print(datapipe.__file__)"
+          work/sdist-check/bin/datapipe --version
+          work/sdist-check/bin/datapipe --help
+          work/sdist-check/bin/datapipe validate-config examples/demo-pipeline-fresh.yaml
+          work/sdist-check/bin/datapipe run examples/demo-pipeline-fresh.yaml --json
+          test -s work/demo-output-fresh/summary.json
